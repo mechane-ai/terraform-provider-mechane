@@ -1,0 +1,7 @@
+Mechane OpenTofu Provider
+Copyright 2026 Mechane contributors
+
+Mechane's original source is licensed under the Apache License, Version 2.0.
+Dependencies retain their individual licenses. Binary release archives include
+their licenses and required source in third_party_licenses, together with the
+Go runtime license.
