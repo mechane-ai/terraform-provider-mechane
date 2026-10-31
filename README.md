@@ -43,6 +43,9 @@ after its rollout ends. A sleeping application can have no running instances, an
 summary for every rollout strategy. Verify a cold sandbox through Mechane after installation to prove actual startup.
 Worker and guest releases must tolerate the mixed-version interval during a rollout.
 
+The provider version is declared in [release.json](release.json) and advances independently of Mechane service releases.
+The installation module pins the provider version it requires.
+
 Build with Go 1.27.3:
 
 ```sh
