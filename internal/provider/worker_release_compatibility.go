@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"regexp"
 	"strings"
 
 	"github.com/cloudflare/cloudflare-go/v7/option"
@@ -36,11 +37,29 @@ func decodeWorkerAdoptionBaseline(value string) (workerAdoptionBaseline, error) 
 	return baseline, validateWorkerFormats(baseline.Formats)
 }
 
+var consoleAPIPrefix = regexp.MustCompile(`^(GET|POST|PUT|DELETE) /v1(/|$| )`)
+
+// The pre-1.0 console release relocated the API once. Compare those names at
+// their new address; persisted formats and migration hashes remain exact.
+func consoleAPIFormats(wire map[string][]string) map[string][]string {
+	result := make(map[string][]string, len(wire))
+	for category, entries := range wire {
+		result[category] = make([]string, len(entries))
+		for index, entry := range entries {
+			if category == "operations" || category == "fields" || category == "members" {
+				entry = consoleAPIPrefix.ReplaceAllString(entry, "${1} /api/v1${2}")
+			}
+			result[category][index] = entry
+		}
+	}
+	return result
+}
+
 func preserveWorkerFormats(previous, desired workerFormats) error {
 	for _, pair := range []struct {
 		previous map[string][]string
 		desired  map[string][]string
-	}{{previous.Wire, desired.Wire}, {previous.Migrations, desired.Migrations}} {
+	}{{consoleAPIFormats(previous.Wire), desired.Wire}, {previous.Migrations, desired.Migrations}} {
 		for category, entries := range pair.previous {
 			candidates, exists := pair.desired[category]
 			if !exists {

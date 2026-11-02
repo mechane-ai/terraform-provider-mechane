@@ -31,11 +31,12 @@ type workerFormats struct {
 }
 
 type workerReleaseManifest struct {
-	FormatVersion int    `json:"format_version"`
-	IsPreview     *bool  `json:"is_preview"`
-	Version       string `json:"version"`
-	Repository    string `json:"repository"`
-	PublicCommit  string `json:"public_commit"`
+	Console       *workerConsoleArtifact `json:"console"`
+	FormatVersion int                    `json:"format_version"`
+	IsPreview     *bool                  `json:"is_preview"`
+	Version       string                 `json:"version"`
+	Repository    string                 `json:"repository"`
+	PublicCommit  string                 `json:"public_commit"`
 	Worker        struct {
 		SHA256             string   `json:"sha256"`
 		Bytes              int64    `json:"bytes"`

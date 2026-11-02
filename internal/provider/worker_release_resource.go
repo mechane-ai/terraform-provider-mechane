@@ -144,7 +144,7 @@ func (r *workerReleaseResource) ValidateConfig(ctx context.Context, request reso
 				continue
 			}
 			switch binding.Type.ValueString() {
-			case "plain_text", "r2_bucket", "secrets_store_secret":
+			case "plain_text", "r2_bucket", "secrets_store_secret", "assets":
 			default:
 				response.Diagnostics.AddAttributeError(path.Root("bindings"), "Unsupported Worker binding", "Use supported resource bindings or Secrets Store references. Credential values and secret_text bindings are not accepted.")
 			}

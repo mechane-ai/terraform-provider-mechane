@@ -26,6 +26,7 @@ type workerLimits struct {
 }
 
 type workerVersion struct {
+	Assets             *workerAssets           `json:"assets,omitempty"`
 	ID                 string                  `json:"id,omitempty"`
 	MainModule         string                  `json:"main_module"`
 	CompatibilityDate  string                  `json:"compatibility_date"`
@@ -167,6 +168,14 @@ func (r *workerReleaseResource) uploadWorkerRelease(ctx context.Context, model w
 		Limits:      workerLimits{CPUMilliseconds: config.CPUMilliseconds},
 		Modules:     []workerModule{{Name: config.MainModule, ContentType: "application/javascript+module", ContentBase64: base64.StdEncoding.EncodeToString(content)}},
 		Annotations: map[string]string{"workers/tag": "v" + config.ReleaseVersion, "workers/message": workerReleaseMessage(config, fingerprint)},
+	}
+
+	if config.Assets != nil {
+		token, err := r.uploadWorkerAssets(ctx, model)
+		if err != nil {
+			return workerVersion{}, err
+		}
+		version.Assets = &workerAssets{JWT: token, Config: *config.Assets}
 	}
 	bytes, err := json.Marshal(version)
 	if err != nil {
