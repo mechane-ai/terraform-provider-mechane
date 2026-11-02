@@ -228,14 +228,23 @@ func (r *workerReleaseResource) activateWorkerRelease(ctx context.Context, model
 	}
 	var envelope workerEnvelope[workerDeployment]
 	postError := r.client.Post(ctx, workerDeploymentPath(model), nil, &envelope, option.WithRequestBody("application/json", bytes))
-	current, err = r.getWorkerDeployment(ctx, model)
-	if err == nil && len(current.Versions) == 1 && current.Versions[0].VersionID == versionID && current.Versions[0].Percentage == 100 {
-		return current, nil
+	// Activation can be accepted before the read endpoint reflects it. Reconcile reads, never repeat the POST.
+	confirmation, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	for {
+		current, err = r.getWorkerDeployment(confirmation, model)
+		if err == nil && len(current.Versions) == 1 && current.Versions[0].VersionID == versionID && current.Versions[0].Percentage == 100 {
+			return current, nil
+		}
+		select {
+		case <-confirmation.Done():
+			if postError != nil {
+				return workerDeployment{}, errors.New(describeCloudflareError(postError))
+			}
+			return workerDeployment{}, errors.New("The requested Worker version is not exclusively active. Refresh state and retry; the existing version will be reused.")
+		case <-time.After(2 * time.Second):
+		}
 	}
-	if postError != nil {
-		return workerDeployment{}, errors.New(describeCloudflareError(postError))
-	}
-	return workerDeployment{}, errors.New("The requested Worker version is not exclusively active. Refresh state and retry; the existing version will be reused.")
 }
 
 func (r *workerReleaseResource) applyRelease(ctx context.Context, plan workerReleaseModel) (workerReleaseModel, error) {
