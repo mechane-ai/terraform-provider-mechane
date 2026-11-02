@@ -2,20 +2,16 @@ package provider
 
 import (
 	"context"
-	"regexp"
 	"strings"
 	"time"
 
 	"github.com/cloudflare/cloudflare-go/v7"
-	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/float64default"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/setdefault"
-	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
@@ -35,6 +31,7 @@ type workerReleaseModel struct {
 	CompatibilityDate       types.String  `tfsdk:"compatibility_date"`
 	CompatibilityFlags      types.Set     `tfsdk:"compatibility_flags"`
 	Bindings                types.Set     `tfsdk:"bindings"`
+	DurableObjectBindings   types.Set     `tfsdk:"durable_object_bindings"`
 	Exports                 types.Map     `tfsdk:"exports"`
 	ContainerClasses        types.Set     `tfsdk:"container_classes"`
 	CPUMilliseconds         types.Int64   `tfsdk:"cpu_ms"`
@@ -58,29 +55,29 @@ func (r *workerReleaseResource) Metadata(_ context.Context, request resource.Met
 
 func (r *workerReleaseResource) Schema(_ context.Context, _ resource.SchemaRequest, response *resource.SchemaResponse) {
 	immutable := []planmodifier.String{stringplanmodifier.RequiresReplace()}
-	emptySet := setdefault.StaticValue(types.SetValueMust(types.StringType, []attr.Value{}))
 	response.Schema = schema.Schema{
 		Description: "An immutable Worker bundle, its reference-only bindings, and exclusive activation. The separate Worker resource owns identity and deletion; removing this release retains versions, Durable Objects, and their data.",
 		Attributes: map[string]schema.Attribute{
 			"account_id":              schema.StringAttribute{Required: true, PlanModifiers: immutable},
 			"worker_name":             schema.StringAttribute{Required: true, PlanModifiers: immutable},
-			"bundle_file":             schema.StringAttribute{Required: true},
-			"bundle_sha256":           schema.StringAttribute{Required: true},
+			"bundle_file":             schema.StringAttribute{Computed: true},
+			"bundle_sha256":           schema.StringAttribute{Computed: true},
 			"release_manifest_file":   schema.StringAttribute{Required: true, Description: "Local installation.json from the immutable published release."},
 			"release_manifest_sha256": schema.StringAttribute{Required: true, Description: "SHA-256 of installation.json, recorded on every uploaded Worker version."},
 			"adoption_baseline":       schema.StringAttribute{Optional: true, Description: "One-time JSON baseline for an unmarked legacy Worker. It binds worker_version_id, bundle_sha256, release_version, and complete formats maps. Remove it after adoption."},
-			"compatibility_date":      schema.StringAttribute{Required: true},
-			"compatibility_flags":     schema.SetAttribute{Optional: true, Computed: true, ElementType: types.StringType, Default: emptySet},
+			"compatibility_date":      schema.StringAttribute{Computed: true},
+			"compatibility_flags":     schema.SetAttribute{Computed: true, ElementType: types.StringType},
 			"bindings":                schema.SetNestedAttribute{Required: true, NestedObject: schema.NestedAttributeObject{Attributes: workerBindingAttributes()}},
-			"exports": schema.MapNestedAttribute{Required: true, NestedObject: schema.NestedAttributeObject{Attributes: map[string]schema.Attribute{
-				"type":    schema.StringAttribute{Required: true},
-				"storage": schema.StringAttribute{Required: true},
-				"state":   schema.StringAttribute{Optional: true, Computed: true, Default: stringdefault.StaticString("created")},
+			"durable_object_bindings": schema.SetNestedAttribute{Computed: true, NestedObject: schema.NestedAttributeObject{Attributes: computedWorkerBindingAttributes()}},
+			"exports": schema.MapNestedAttribute{Computed: true, NestedObject: schema.NestedAttributeObject{Attributes: map[string]schema.Attribute{
+				"type":    schema.StringAttribute{Computed: true},
+				"storage": schema.StringAttribute{Computed: true},
+				"state":   schema.StringAttribute{Computed: true},
 			}}},
-			"container_classes":         schema.SetAttribute{Optional: true, Computed: true, ElementType: types.StringType, Default: emptySet},
+			"container_classes":         schema.SetAttribute{Computed: true, ElementType: types.StringType},
 			"cpu_ms":                    schema.Int64Attribute{Optional: true, Computed: true, Default: int64default.StaticInt64(300000)},
-			"release_version":           schema.StringAttribute{Required: true},
-			"source_revision":           schema.StringAttribute{Required: true},
+			"release_version":           schema.StringAttribute{Computed: true},
+			"source_revision":           schema.StringAttribute{Computed: true},
 			"traffic_percentage":        schema.Float64Attribute{Optional: true, Computed: true, Default: float64default.StaticFloat64(100), Description: "Exclusive activation is required. Refresh reports drift when another deployment changes traffic."},
 			"operation_timeout_seconds": schema.Int64Attribute{Optional: true, Computed: true, Default: int64default.StaticInt64(300)},
 			"id":                        schema.StringAttribute{Computed: true, PlanModifiers: []planmodifier.String{stringplanmodifier.UseStateForUnknown()}},
@@ -122,19 +119,8 @@ func (r *workerReleaseResource) ValidateConfig(ctx context.Context, request reso
 	if response.Diagnostics.HasError() {
 		return
 	}
-	for name, value := range map[string]types.String{"bundle_sha256": config.BundleSHA256, "release_manifest_sha256": config.ReleaseManifestSHA256, "source_revision": config.SourceRevision} {
-		pattern := `^[a-f0-9]{64}$`
-		if name == "source_revision" {
-			pattern = `^[a-f0-9]{40}$`
-		}
-		if !value.IsUnknown() && !regexp.MustCompile(pattern).MatchString(value.ValueString()) {
-			response.Diagnostics.AddAttributeError(path.Root(name), "Invalid release digest", "Use the complete lowercase hexadecimal digest from the release manifest.")
-		}
-	}
-	if !config.ReleaseVersion.IsUnknown() && !config.ReleaseVersion.IsNull() {
-		if _, err := parseWorkerReleaseVersion(config.ReleaseVersion.ValueString()); err != nil {
-			response.Diagnostics.AddAttributeError(path.Root("release_version"), "Invalid release version", err.Error())
-		}
+	if !config.ReleaseManifestSHA256.IsUnknown() && !workerSHA256Pattern.MatchString(config.ReleaseManifestSHA256.ValueString()) {
+		response.Diagnostics.AddAttributeError(path.Root("release_manifest_sha256"), "Invalid release digest", "Use the complete lowercase hexadecimal digest from the release manifest.")
 	}
 	if !config.AdoptionBaseline.IsUnknown() && !config.AdoptionBaseline.IsNull() {
 		if _, err := decodeWorkerAdoptionBaseline(config.AdoptionBaseline.ValueString()); err != nil {
@@ -158,28 +144,10 @@ func (r *workerReleaseResource) ValidateConfig(ctx context.Context, request reso
 				continue
 			}
 			switch binding.Type.ValueString() {
-			case "plain_text", "durable_object_namespace", "r2_bucket", "secrets_store_secret":
+			case "plain_text", "r2_bucket", "secrets_store_secret":
 			default:
 				response.Diagnostics.AddAttributeError(path.Root("bindings"), "Unsupported Worker binding", "Use supported resource bindings or Secrets Store references. Credential values and secret_text bindings are not accepted.")
 			}
-		}
-	}
-	if !config.Exports.IsUnknown() {
-		var exports map[string]workerExportModel
-		response.Diagnostics.Append(config.Exports.ElementsAs(ctx, &exports, true)...)
-		for _, export := range exports {
-			invalidType := !export.Type.IsUnknown() && export.Type.ValueString() != "durable-object"
-			invalidStorage := !export.Storage.IsUnknown() && export.Storage.ValueString() != "sqlite"
-			invalidState := !export.State.IsUnknown() && !export.State.IsNull() && export.State.ValueString() != "created"
-			if invalidType || invalidStorage || invalidState {
-				response.Diagnostics.AddAttributeError(path.Root("exports"), "Destructive export change refused", "Release exports must name live SQLite Durable Object classes. Deletion, renaming, and transfer require a separate explicit migration.")
-			}
-		}
-	}
-	if request.Config.Raw.IsFullyKnown() {
-		_, err := workerConfiguration(ctx, config)
-		if err != nil {
-			response.Diagnostics.AddError("Invalid Worker release", err.Error())
 		}
 	}
 }
@@ -245,7 +213,7 @@ func (r *workerReleaseResource) Read(ctx context.Context, request resource.ReadR
 }
 
 func (r *workerReleaseResource) Delete(_ context.Context, _ resource.DeleteRequest, _ *resource.DeleteResponse) {
-	// The Worker identity resource owns deletion; retained versions remain usable for rollback.
+	// The Worker identity resource owns deletion; removing release state retains versions and application data.
 }
 
 func (r *workerReleaseResource) ImportState(ctx context.Context, request resource.ImportStateRequest, response *resource.ImportStateResponse) {
@@ -286,4 +254,12 @@ func (r *workerReleaseResource) ImportState(ctx context.Context, request resourc
 	}
 	state.readWorkerDeployment(deployment)
 	response.Diagnostics.Append(response.State.Set(ctx, &state)...)
+}
+
+func computedWorkerBindingAttributes() map[string]schema.Attribute {
+	attributes := map[string]schema.Attribute{}
+	for name := range workerBindingAttributes() {
+		attributes[name] = schema.StringAttribute{Computed: true}
+	}
+	return attributes
 }

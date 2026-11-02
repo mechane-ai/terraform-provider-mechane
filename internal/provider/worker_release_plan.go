@@ -12,25 +12,43 @@ import (
 // Existing classes keep their namespace within one Worker. Planning each class
 // separately preserves dependent containers while leaving new namespaces unknown.
 func (r *workerReleaseResource) ModifyPlan(ctx context.Context, request resource.ModifyPlanRequest, response *resource.ModifyPlanResponse) {
-	if request.State.Raw.IsNull() || request.Plan.Raw.IsNull() {
+	if request.Plan.Raw.IsNull() {
 		return
 	}
 	var state, plan workerReleaseModel
-	response.Diagnostics.Append(request.State.Get(ctx, &state)...)
+	if !request.State.Raw.IsNull() {
+		response.Diagnostics.Append(request.State.Get(ctx, &state)...)
+	}
 	response.Diagnostics.Append(request.Plan.Get(ctx, &plan)...)
 	if response.Diagnostics.HasError() {
 		return
 	}
-	if plan.AccountID.IsUnknown() || plan.WorkerName.IsUnknown() || !plan.AccountID.Equal(state.AccountID) || !plan.WorkerName.Equal(state.WorkerName) || plan.Bindings.IsUnknown() {
+	if plan.ReleaseManifestFile.IsUnknown() || plan.ReleaseManifestFile.IsNull() || plan.ReleaseManifestSHA256.IsUnknown() || plan.ReleaseManifestSHA256.IsNull() {
 		return
 	}
-	for _, binding := range plan.Bindings.Elements() {
+	manifest, err := readWorkerManifest(plan)
+	if err != nil {
+		response.Diagnostics.AddError("Read release manifest", err.Error())
+		return
+	}
+	if err = plan.acceptManifest(ctx, manifest); err != nil {
+		response.Diagnostics.AddError("Read release manifest", err.Error())
+		return
+	}
+	response.Diagnostics.Append(response.Plan.Set(ctx, &plan)...)
+	if request.State.Raw.IsNull() || response.Diagnostics.HasError() {
+		return
+	}
+	if plan.AccountID.IsUnknown() || plan.WorkerName.IsUnknown() || !plan.AccountID.Equal(state.AccountID) || !plan.WorkerName.Equal(state.WorkerName) || plan.DurableObjectBindings.IsUnknown() {
+		return
+	}
+	for _, binding := range plan.DurableObjectBindings.Elements() {
 		if binding.IsUnknown() || binding.IsNull() {
 			return
 		}
 	}
 	var bindings []workerBindingModel
-	response.Diagnostics.Append(plan.Bindings.ElementsAs(ctx, &bindings, false)...)
+	response.Diagnostics.Append(plan.DurableObjectBindings.ElementsAs(ctx, &bindings, false)...)
 	if response.Diagnostics.HasError() {
 		return
 	}

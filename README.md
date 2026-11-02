@@ -23,7 +23,11 @@ existing application with `<account_id>/<application_id>`. Import an existing im
 `<account_id>/<repository>@sha256:<digest>`. Keep the corresponding release configuration in OpenTofu. Application
 imports enable deletion protection. Apply `delete_protection = false` before destruction.
 
-Worker releases require `release_manifest_file` and `release_manifest_sha256` for the published `installation.json`.
+Worker releases require `release_manifest_file` and `release_manifest_sha256` for the published `installation.json`. The
+verified manifest supplies the bundle path and digest, release identity, compatibility settings, Durable Object bindings
+and exports, and container classes. These are computed resource attributes. Supply only installation-specific text,
+bucket, and secret-reference bindings; the provider rejects manually supplied Durable Object bindings.
+
 Before uploading or activating a version, the provider verifies the live release's recorded manifest from public GitHub
 release storage and preserves every wire and migration entry. Additions are allowed; removals, changed entries, and
 version downgrades are rejected. Manifest downloads have bounded deadlines and sizes, and never use credentials. An

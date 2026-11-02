@@ -241,13 +241,19 @@ func (r *workerReleaseResource) activateWorkerRelease(ctx context.Context, model
 func (r *workerReleaseResource) applyRelease(ctx context.Context, plan workerReleaseModel) (workerReleaseModel, error) {
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(plan.OperationTimeoutSeconds.ValueInt64())*time.Second)
 	defer cancel()
+	manifest, err := readWorkerManifest(plan)
+	if err != nil {
+		return workerReleaseModel{}, err
+	}
+	if err = plan.acceptManifest(ctx, manifest); err != nil {
+		return workerReleaseModel{}, err
+	}
 	content, err := readWorkerBundle(plan)
 	if err != nil {
 		return workerReleaseModel{}, err
 	}
-	manifest, err := readWorkerManifest(plan)
-	if err != nil {
-		return workerReleaseModel{}, err
+	if int64(len(content)) != manifest.Worker.Bytes {
+		return workerReleaseModel{}, errors.New("The Worker byte count differs from the verified release manifest.")
 	}
 	config, err := workerConfiguration(ctx, plan)
 	if err != nil {

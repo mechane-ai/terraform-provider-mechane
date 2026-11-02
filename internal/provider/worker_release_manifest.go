@@ -8,9 +8,12 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	version "github.com/hashicorp/go-version"
 )
@@ -34,7 +37,17 @@ type workerReleaseManifest struct {
 	Repository    string `json:"repository"`
 	PublicCommit  string `json:"public_commit"`
 	Worker        struct {
-		SHA256 string `json:"sha256"`
+		SHA256             string   `json:"sha256"`
+		Bytes              int64    `json:"bytes"`
+		Path               string   `json:"path"`
+		CompatibilityDate  string   `json:"compatibility_date"`
+		CompatibilityFlags []string `json:"compatibility_flags"`
+		ContainerClasses   []string `json:"container_classes"`
+		Bindings           []struct {
+			Name      string `json:"name"`
+			ClassName string `json:"class_name"`
+		} `json:"bindings"`
+		Exports map[string]workerExport `json:"exports"`
 	} `json:"worker"`
 	Formats workerFormats `json:"formats"`
 }
@@ -129,8 +142,28 @@ func readWorkerManifest(model workerReleaseModel) (workerReleaseManifest, error)
 	if err != nil {
 		return manifest, err
 	}
-	if manifest.Version != model.ReleaseVersion.ValueString() || manifest.PublicCommit != model.SourceRevision.ValueString() || manifest.Worker.SHA256 != model.BundleSHA256.ValueString() {
-		return manifest, errors.New("The installation manifest does not match the requested release version, source revision, and Worker digest.")
+	if manifest.Worker.Path != "worker.js" || manifest.Worker.Bytes <= 0 || manifest.Worker.CompatibilityDate == "" || manifest.Worker.CompatibilityFlags == nil || manifest.Worker.ContainerClasses == nil || len(manifest.Worker.Bindings) == 0 || len(manifest.Worker.Exports) == 0 {
+		return manifest, errors.New("The release manifest must contain complete Worker artifact, compatibility, binding, export, and container metadata.")
+	}
+	if _, err := time.Parse(time.DateOnly, manifest.Worker.CompatibilityDate); err != nil {
+		return manifest, errors.New("The release compatibility date must use YYYY-MM-DD.")
+	}
+	for name, export := range manifest.Worker.Exports {
+		if name == "" || export.Type != "durable-object" || export.Storage != "sqlite" || export.State != "created" {
+			return manifest, errors.New("Release exports must name live SQLite Durable Object classes.")
+		}
+	}
+	seen := map[string]bool{}
+	for _, binding := range manifest.Worker.Bindings {
+		if _, declared := manifest.Worker.Exports[binding.ClassName]; !declared || binding.Name == "" || seen[binding.Name] {
+			return manifest, errors.New("Release bindings must have distinct names and refer to declared SQLite exports.")
+		}
+		seen[binding.Name] = true
+	}
+	for _, class := range manifest.Worker.ContainerClasses {
+		if _, declared := manifest.Worker.Exports[class]; !declared {
+			return manifest, errors.New("Release container classes must refer to declared SQLite exports.")
+		}
 	}
 	return manifest, nil
 }
@@ -178,4 +211,41 @@ func downloadWorkerManifest(ctx context.Context, repository string, live workerR
 		return manifest, errors.New("The recorded installation manifest disagrees with the live Worker version, source revision, or actual bundle bytes.")
 	}
 	return manifest, nil
+}
+
+// Only verified release metadata supplies immutable Worker configuration. The
+// persisted attribute types stay unchanged so existing resource identities survive.
+func (model *workerReleaseModel) acceptManifest(ctx context.Context, manifest workerReleaseManifest) error {
+	model.BundleFile = types.StringValue(filepath.Join(filepath.Dir(model.ReleaseManifestFile.ValueString()), manifest.Worker.Path))
+	model.BundleSHA256 = types.StringValue(manifest.Worker.SHA256)
+	model.ReleaseVersion = types.StringValue(manifest.Version)
+	model.SourceRevision = types.StringValue(manifest.PublicCommit)
+	model.CompatibilityDate = types.StringValue(manifest.Worker.CompatibilityDate)
+	flags, diagnostics := types.SetValueFrom(ctx, types.StringType, manifest.Worker.CompatibilityFlags)
+	if diagnostics.HasError() {
+		return errors.New("The release compatibility flags are invalid.")
+	}
+	model.CompatibilityFlags = flags
+	classes, diagnostics := types.SetValueFrom(ctx, types.StringType, manifest.Worker.ContainerClasses)
+	if diagnostics.HasError() {
+		return errors.New("The release container classes are invalid.")
+	}
+	model.ContainerClasses = classes
+	exports := map[string]workerExportModel{}
+	for name, export := range manifest.Worker.Exports {
+		exports[name] = workerExportModel{Type: types.StringValue(export.Type), Storage: types.StringValue(export.Storage), State: types.StringValue(export.State)}
+	}
+	model.Exports, diagnostics = types.MapValueFrom(ctx, workerExportObjectType(), exports)
+	if diagnostics.HasError() {
+		return errors.New("The release exports are invalid.")
+	}
+	bindings := []workerBindingModel{}
+	for _, binding := range manifest.Worker.Bindings {
+		bindings = append(bindings, workerBindingModel{Name: types.StringValue(binding.Name), Type: types.StringValue("durable_object_namespace"), ClassName: types.StringValue(binding.ClassName)})
+	}
+	model.DurableObjectBindings, diagnostics = types.SetValueFrom(ctx, workerBindingObjectType(), bindings)
+	if diagnostics.HasError() {
+		return errors.New("The release Durable Object bindings are invalid.")
+	}
+	return nil
 }

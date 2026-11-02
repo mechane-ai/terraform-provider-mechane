@@ -83,6 +83,11 @@ func workerConfiguration(ctx context.Context, model workerReleaseModel) (workerR
 	if diagnostics := model.Bindings.ElementsAs(ctx, &bindings, false); diagnostics.HasError() {
 		return config, errors.New("Worker bindings must be fully known before applying.")
 	}
+	var durableBindings []workerBindingModel
+	if diagnostics := model.DurableObjectBindings.ElementsAs(ctx, &durableBindings, false); diagnostics.HasError() {
+		return config, errors.New("Release Durable Object bindings must be fully known before applying.")
+	}
+	bindings = append(bindings, durableBindings...)
 	seen := map[string]bool{}
 	for _, binding := range bindings {
 		value := workerBinding{
@@ -248,17 +253,27 @@ func (model *workerReleaseModel) readWorkerVersion(ctx context.Context, version 
 	}
 	model.CompatibilityFlags = flags
 	bindings := []workerBindingModel{}
+	durableBindings := []workerBindingModel{}
 	for _, binding := range config.Bindings {
 		text := types.StringNull()
 		if binding.Type == "plain_text" {
 			text = types.StringPointerValue(binding.Text)
 		}
-		bindings = append(bindings, workerBindingModel{
+		value := workerBindingModel{
 			Name: types.StringValue(binding.Name), Type: types.StringValue(binding.Type), Text: text,
 			ClassName: types.StringPointerValue(binding.ClassName), BucketName: types.StringPointerValue(binding.BucketName),
 			Jurisdiction: types.StringPointerValue(binding.Jurisdiction), StoreID: types.StringPointerValue(binding.StoreID),
 			SecretName: types.StringPointerValue(binding.SecretName),
-		})
+		}
+		if binding.Type == "durable_object_namespace" {
+			durableBindings = append(durableBindings, value)
+		} else {
+			bindings = append(bindings, value)
+		}
+	}
+	model.DurableObjectBindings, diagnostics = types.SetValueFrom(ctx, workerBindingObjectType(), durableBindings)
+	if diagnostics.HasError() {
+		return errors.New("The Worker Durable Object bindings could not be decoded.")
 	}
 	model.Bindings, diagnostics = types.SetValueFrom(ctx, workerBindingObjectType(), bindings)
 	if diagnostics.HasError() {
