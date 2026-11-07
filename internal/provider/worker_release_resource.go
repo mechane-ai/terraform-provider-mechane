@@ -27,7 +27,6 @@ type workerReleaseModel struct {
 	BundleSHA256            types.String  `tfsdk:"bundle_sha256"`
 	ReleaseManifestFile     types.String  `tfsdk:"release_manifest_file"`
 	ReleaseManifestSHA256   types.String  `tfsdk:"release_manifest_sha256"`
-	AdoptionBaseline        types.String  `tfsdk:"adoption_baseline"`
 	CompatibilityDate       types.String  `tfsdk:"compatibility_date"`
 	CompatibilityFlags      types.Set     `tfsdk:"compatibility_flags"`
 	Bindings                types.Set     `tfsdk:"bindings"`
@@ -64,7 +63,6 @@ func (r *workerReleaseResource) Schema(_ context.Context, _ resource.SchemaReque
 			"bundle_sha256":           schema.StringAttribute{Computed: true},
 			"release_manifest_file":   schema.StringAttribute{Required: true, Description: "Local installation.json from the immutable published release."},
 			"release_manifest_sha256": schema.StringAttribute{Required: true, Description: "SHA-256 of installation.json, recorded on every uploaded Worker version."},
-			"adoption_baseline":       schema.StringAttribute{Optional: true, Description: "One-time JSON baseline for an unmarked legacy Worker. It binds worker_version_id, bundle_sha256, release_version, and complete formats maps. Remove it after adoption."},
 			"compatibility_date":      schema.StringAttribute{Computed: true},
 			"compatibility_flags":     schema.SetAttribute{Computed: true, ElementType: types.StringType},
 			"bindings":                schema.SetNestedAttribute{Required: true, NestedObject: schema.NestedAttributeObject{Attributes: workerBindingAttributes()}},
@@ -122,11 +120,6 @@ func (r *workerReleaseResource) ValidateConfig(ctx context.Context, request reso
 	if !config.ReleaseManifestSHA256.IsUnknown() && !workerSHA256Pattern.MatchString(config.ReleaseManifestSHA256.ValueString()) {
 		response.Diagnostics.AddAttributeError(path.Root("release_manifest_sha256"), "Invalid release digest", "Use the complete lowercase hexadecimal digest from the release manifest.")
 	}
-	if !config.AdoptionBaseline.IsUnknown() && !config.AdoptionBaseline.IsNull() {
-		if _, err := decodeWorkerAdoptionBaseline(config.AdoptionBaseline.ValueString()); err != nil {
-			response.Diagnostics.AddAttributeError(path.Root("adoption_baseline"), "Invalid adoption baseline", err.Error())
-		}
-	}
 	if !config.TrafficPercentage.IsNull() && !config.TrafficPercentage.IsUnknown() && config.TrafficPercentage.ValueFloat64() != 100 {
 		response.Diagnostics.AddAttributeError(path.Root("traffic_percentage"), "Exclusive deployment required", "A Mechane release must receive 100 percent of traffic.")
 	}
@@ -144,7 +137,7 @@ func (r *workerReleaseResource) ValidateConfig(ctx context.Context, request reso
 				continue
 			}
 			switch binding.Type.ValueString() {
-			case "plain_text", "r2_bucket", "secrets_store_secret", "assets":
+			case "plain_text", "r2_bucket", "secrets_store_secret":
 			default:
 				response.Diagnostics.AddAttributeError(path.Root("bindings"), "Unsupported Worker binding", "Use supported resource bindings or Secrets Store references. Credential values and secret_text bindings are not accepted.")
 			}

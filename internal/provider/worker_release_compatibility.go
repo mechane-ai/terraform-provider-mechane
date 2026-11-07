@@ -2,64 +2,16 @@ package provider
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"io"
-	"regexp"
-	"strings"
 
 	"github.com/cloudflare/cloudflare-go/v7/option"
 )
-
-type workerAdoptionBaseline struct {
-	WorkerVersionID string        `json:"worker_version_id"`
-	BundleSHA256    string        `json:"bundle_sha256"`
-	ReleaseVersion  string        `json:"release_version"`
-	Formats         workerFormats `json:"formats"`
-}
-
-func decodeWorkerAdoptionBaseline(value string) (workerAdoptionBaseline, error) {
-	var baseline workerAdoptionBaseline
-	if value == "" || len(value) > maximumWorkerManifestBytes {
-		return baseline, errors.New("An unmarked live Worker requires a reviewed adoption_baseline identifying its exact version, bundle digest, release version, and complete compatibility maps.")
-	}
-	decoder := json.NewDecoder(strings.NewReader(value))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&baseline) != nil || decoder.Decode(&struct{}{}) != io.EOF {
-		return baseline, errors.New("The adoption baseline is not valid adoption metadata.")
-	}
-	if baseline.WorkerVersionID == "" || !workerSHA256Pattern.MatchString(baseline.BundleSHA256) {
-		return baseline, errors.New("The adoption baseline must identify the observed Worker version ID and its complete bundle SHA-256.")
-	}
-	if _, err := parseWorkerReleaseVersion(baseline.ReleaseVersion); err != nil {
-		return baseline, err
-	}
-	return baseline, validateWorkerFormats(baseline.Formats)
-}
-
-var consoleAPIPrefix = regexp.MustCompile(`^(GET|POST|PUT|DELETE) /v1(/|$| )`)
-
-// The pre-1.0 console release relocated the API once. Compare those names at
-// their new address; persisted formats and migration hashes remain exact.
-func consoleAPIFormats(wire map[string][]string) map[string][]string {
-	result := make(map[string][]string, len(wire))
-	for category, entries := range wire {
-		result[category] = make([]string, len(entries))
-		for index, entry := range entries {
-			if category == "operations" || category == "fields" || category == "members" {
-				entry = consoleAPIPrefix.ReplaceAllString(entry, "${1} /api/v1${2}")
-			}
-			result[category][index] = entry
-		}
-	}
-	return result
-}
 
 func preserveWorkerFormats(previous, desired workerFormats) error {
 	for _, pair := range []struct {
 		previous map[string][]string
 		desired  map[string][]string
-	}{{consoleAPIFormats(previous.Wire), desired.Wire}, {previous.Migrations, desired.Migrations}} {
+	}{{previous.Wire, desired.Wire}, {previous.Migrations, desired.Migrations}} {
 		for category, entries := range pair.previous {
 			candidates, exists := pair.desired[category]
 			if !exists {
@@ -120,7 +72,7 @@ func (r *workerReleaseResource) preflightWorkerCompatibility(ctx context.Context
 		if err != nil {
 			return "", errors.New(describeCloudflareError(err))
 		}
-		if err = checkWorkerCompatibility(ctx, model, desired, live); err != nil {
+		if err = checkWorkerCompatibility(ctx, desired, live); err != nil {
 			return "", err
 		}
 	}
@@ -130,7 +82,7 @@ func (r *workerReleaseResource) preflightWorkerCompatibility(ctx context.Context
 	return deployment.ID, nil
 }
 
-func checkWorkerCompatibility(ctx context.Context, model workerReleaseModel, desired workerReleaseManifest, live workerVersion) error {
+func checkWorkerCompatibility(ctx context.Context, desired workerReleaseManifest, live workerVersion) error {
 	configuration, err := live.configuration()
 	if err != nil {
 		return err
@@ -139,33 +91,19 @@ func checkWorkerCompatibility(ctx context.Context, model workerReleaseModel, des
 	if err != nil {
 		return err
 	}
-	var previous workerFormats
-	var previousVersion string
-	if marked {
-		fingerprint, err := configuration.fingerprint()
-		if err != nil || fingerprint != marker.Fingerprint {
-			return errors.New("The live Worker's native release marker disagrees with its actual bytes or configuration. Adoption cannot override this mismatch.")
-		}
-		manifest, err := downloadWorkerManifest(ctx, desired.Repository, configuration)
-		if err != nil {
-			return err
-		}
-		previous, previousVersion = manifest.Formats, manifest.Version
-	} else {
-		baseline, err := decodeWorkerAdoptionBaseline(model.AdoptionBaseline.ValueString())
-		if err != nil {
-			return err
-		}
-		if baseline.WorkerVersionID != live.ID || baseline.BundleSHA256 != configuration.BundleSHA256 {
-			return errors.New("The adoption baseline does not match the currently active Worker version and actual bundle bytes. Review a new baseline before applying.")
-		}
-		if _, err := parseWorkerReleaseVersion(configuration.ReleaseVersion); err == nil && baseline.ReleaseVersion != configuration.ReleaseVersion {
-			return errors.New("The adoption baseline release version does not match the live Worker's release tag.")
-		}
-		previous, previousVersion = baseline.Formats, baseline.ReleaseVersion
+	if !marked {
+		return errors.New("The active Worker has no verified release marker. Deploy a new owned compute service instead of adopting an unmarked installation.")
 	}
-	if err = rejectWorkerDowngrade(previousVersion, desired.Version); err != nil {
+	fingerprint, err := configuration.fingerprint()
+	if err != nil || fingerprint != marker.Fingerprint {
+		return errors.New("The live Worker's release marker disagrees with its actual bytes or configuration.")
+	}
+	manifest, err := downloadWorkerManifest(ctx, desired.Repository, configuration)
+	if err != nil {
 		return err
 	}
-	return preserveWorkerFormats(previous, desired.Formats)
+	if err = rejectWorkerDowngrade(manifest.Version, desired.Version); err != nil {
+		return err
+	}
+	return preserveWorkerFormats(manifest.Formats, desired.Formats)
 }

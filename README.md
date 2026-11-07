@@ -1,8 +1,8 @@
 # Mechane provider
 
 The Mechane OpenTofu provider installs Workers and Cloudflare Containers from immutable releases. Use the
-[Mechane installation module](https://github.com/mechane-ai/mechane) for a complete service. The official Cloudflare
-provider owns Worker identities, custom domains, and R2.
+[Mechane installation module](https://github.com/mechane-ai/mechane) for the compute service and ingress gateway. The
+Node service is deployed separately. The official Cloudflare provider owns Worker identities, custom domains, and R2.
 
 Set `CLOUDFLARE_API_TOKEN` in the process environment. The token needs Workers and Containers access, plus Secrets Store
 Edit when binding account secrets. Credentials never become resource attributes.
@@ -30,11 +30,8 @@ bucket, and secret-reference bindings; the provider rejects manually supplied Du
 
 Before uploading or activating a version, the provider verifies the live release's recorded manifest from public GitHub
 release storage and preserves every wire and migration entry. Additions are allowed; removals, changed entries, and
-version downgrades are rejected. Manifest downloads have bounded deadlines and sizes, and never use credentials. An
-unmarked legacy Worker requires a reviewed `adoption_baseline` JSON string containing `worker_version_id`,
-`bundle_sha256`, `release_version`, and `formats` with complete `wire` and `migrations` maps. Its ID and digest must
-match the active Worker. Once adopted, the recorded native manifest is authoritative; remove the baseline input without
-uploading another version. A baseline cannot bypass a missing or invalid native manifest. The provider checks deployment
+version downgrades are rejected. Manifest downloads have bounded deadlines and sizes, and never use credentials.
+Unmarked Workers are not adopted. A new installation needs its own Worker identity. The provider checks deployment
 identity again before a write and stops if it observes a concurrent change. Cloudflare does not offer atomic
 compare-and-swap for deployment, so use one deployment writer per installation.
 

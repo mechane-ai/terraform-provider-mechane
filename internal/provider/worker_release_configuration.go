@@ -57,18 +57,17 @@ type workerContainer struct {
 }
 
 type workerReleaseConfiguration struct {
-	Assets                *workerAssetConfiguration `json:"assets,omitempty"`
-	BundleSHA256          string                    `json:"bundle_sha256"`
-	MainModule            string                    `json:"main_module"`
-	CompatibilityDate     string                    `json:"compatibility_date"`
-	CompatibilityFlags    []string                  `json:"compatibility_flags"`
-	Bindings              []workerBinding           `json:"bindings"`
-	Exports               map[string]workerExport   `json:"exports"`
-	Containers            []workerContainer         `json:"containers"`
-	CPUMilliseconds       int64                     `json:"cpu_ms"`
-	ReleaseVersion        string                    `json:"release_version"`
-	SourceRevision        string                    `json:"source_revision"`
-	ReleaseManifestSHA256 string                    `json:"release_manifest_sha256"`
+	BundleSHA256          string                  `json:"bundle_sha256"`
+	MainModule            string                  `json:"main_module"`
+	CompatibilityDate     string                  `json:"compatibility_date"`
+	CompatibilityFlags    []string                `json:"compatibility_flags"`
+	Bindings              []workerBinding         `json:"bindings"`
+	Exports               map[string]workerExport `json:"exports"`
+	Containers            []workerContainer       `json:"containers"`
+	CPUMilliseconds       int64                   `json:"cpu_ms"`
+	ReleaseVersion        string                  `json:"release_version"`
+	SourceRevision        string                  `json:"source_revision"`
+	ReleaseManifestSHA256 string                  `json:"release_manifest_sha256"`
 }
 
 func workerConfiguration(ctx context.Context, model workerReleaseModel) (workerReleaseConfiguration, error) {
@@ -105,10 +104,6 @@ func workerConfiguration(ctx context.Context, model workerReleaseModel) (workerR
 			return config, err
 		}
 		config.Bindings = append(config.Bindings, value)
-		if value.Type == "assets" {
-			assets := consoleAssetConfiguration()
-			config.Assets = &assets
-		}
 	}
 	var exports map[string]workerExportModel
 	if diagnostics := model.Exports.ElementsAs(ctx, &exports, false); diagnostics.HasError() {
@@ -155,8 +150,6 @@ func workerConfiguration(ctx context.Context, model workerReleaseModel) (workerR
 func validateWorkerBinding(binding workerBinding) error {
 	valid := false
 	switch binding.Type {
-	case "assets":
-		valid = binding.Name == "ASSETS" && binding.Text == nil && binding.ClassName == nil && binding.BucketName == nil && binding.Jurisdiction == nil && binding.StoreID == nil && binding.SecretName == nil
 	case "plain_text":
 		valid = binding.Text != nil && binding.ClassName == nil && binding.BucketName == nil && binding.Jurisdiction == nil && binding.StoreID == nil && binding.SecretName == nil
 	case "durable_object_namespace":
@@ -332,9 +325,6 @@ func (version workerVersion) configuration() (workerReleaseConfiguration, error)
 		MainModule: version.MainModule, CompatibilityDate: version.CompatibilityDate, CompatibilityFlags: version.CompatibilityFlags,
 		Bindings: slices.Clone(version.Bindings), Exports: version.Exports, Containers: slices.Clone(version.Containers),
 		CPUMilliseconds: version.Limits.CPUMilliseconds, ReleaseVersion: strings.TrimPrefix(version.Annotations["workers/tag"], "v"),
-	}
-	if version.Assets != nil {
-		config.Assets = &version.Assets.Config
 	}
 	if version.ID == "" || len(version.Modules) != 1 || version.Modules[0].Name != version.MainModule {
 		return config, errors.New("The Worker version must contain exactly one main module.")

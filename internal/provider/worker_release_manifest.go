@@ -31,12 +31,11 @@ type workerFormats struct {
 }
 
 type workerReleaseManifest struct {
-	Console       *workerConsoleArtifact `json:"console"`
-	FormatVersion int                    `json:"format_version"`
-	IsPreview     *bool                  `json:"is_preview"`
-	Version       string                 `json:"version"`
-	Repository    string                 `json:"repository"`
-	PublicCommit  string                 `json:"public_commit"`
+	FormatVersion int    `json:"format_version"`
+	IsPreview     *bool  `json:"is_preview"`
+	Version       string `json:"version"`
+	Repository    string `json:"repository"`
+	PublicCommit  string `json:"public_commit"`
 	Worker        struct {
 		SHA256             string   `json:"sha256"`
 		Bytes              int64    `json:"bytes"`
@@ -75,7 +74,7 @@ func parseWorkerReleaseMarker(message string) (workerReleaseMarker, bool, error)
 	}
 	parts := strings.Split(message, ":")
 	if len(parts) != 4 || !workerRevisionPattern.MatchString(parts[1]) || !workerSHA256Pattern.MatchString(parts[2]) || !workerSHA256Pattern.MatchString(parts[3]) {
-		return workerReleaseMarker{}, true, errors.New("The live Worker has malformed native release metadata. Adoption cannot override a native release marker.")
+		return workerReleaseMarker{}, true, errors.New("The live Worker has malformed native release metadata.")
 	}
 	return workerReleaseMarker{SourceRevision: parts[1], Fingerprint: parts[2], ManifestSHA256: parts[3]}, true, nil
 }
@@ -202,7 +201,7 @@ func downloadWorkerManifest(ctx context.Context, repository string, live workerR
 		return workerReleaseManifest{}, err
 	}
 	if workerDigest(content) != live.ReleaseManifestSHA256 {
-		return workerReleaseManifest{}, errors.New("The published installation manifest does not match the live Worker's recorded SHA-256. Adoption cannot override this mismatch.")
+		return workerReleaseManifest{}, errors.New("The published installation manifest does not match the live Worker's recorded SHA-256.")
 	}
 	manifest, err := decodeWorkerManifest(content)
 	if err != nil {
@@ -214,8 +213,7 @@ func downloadWorkerManifest(ctx context.Context, repository string, live workerR
 	return manifest, nil
 }
 
-// Only verified release metadata supplies immutable Worker configuration. The
-// persisted attribute types stay unchanged so existing resource identities survive.
+// Only verified release metadata supplies immutable Worker configuration.
 func (model *workerReleaseModel) acceptManifest(ctx context.Context, manifest workerReleaseManifest) error {
 	model.BundleFile = types.StringValue(filepath.Join(filepath.Dir(model.ReleaseManifestFile.ValueString()), manifest.Worker.Path))
 	model.BundleSHA256 = types.StringValue(manifest.Worker.SHA256)
