@@ -27,6 +27,8 @@ type workerReleaseModel struct {
 	BundleSHA256            types.String  `tfsdk:"bundle_sha256"`
 	ReleaseManifestFile     types.String  `tfsdk:"release_manifest_file"`
 	ReleaseManifestSHA256   types.String  `tfsdk:"release_manifest_sha256"`
+	QualificationFile       types.String  `tfsdk:"qualification_file"`
+	QualificationSHA256     types.String  `tfsdk:"qualification_sha256"`
 	CompatibilityDate       types.String  `tfsdk:"compatibility_date"`
 	CompatibilityFlags      types.Set     `tfsdk:"compatibility_flags"`
 	Bindings                types.Set     `tfsdk:"bindings"`
@@ -55,14 +57,17 @@ func (r *workerReleaseResource) Metadata(_ context.Context, request resource.Met
 func (r *workerReleaseResource) Schema(_ context.Context, _ resource.SchemaRequest, response *resource.SchemaResponse) {
 	immutable := []planmodifier.String{stringplanmodifier.RequiresReplace()}
 	response.Schema = schema.Schema{
+		Version:     1,
 		Description: "An immutable Worker bundle, its reference-only bindings, and exclusive activation. The separate Worker resource owns identity and deletion; removing this release retains versions, Durable Objects, and their data.",
 		Attributes: map[string]schema.Attribute{
 			"account_id":              schema.StringAttribute{Required: true, PlanModifiers: immutable},
 			"worker_name":             schema.StringAttribute{Required: true, PlanModifiers: immutable},
 			"bundle_file":             schema.StringAttribute{Computed: true},
 			"bundle_sha256":           schema.StringAttribute{Computed: true},
-			"release_manifest_file":   schema.StringAttribute{Required: true, Description: "Local installation.json from the immutable published release."},
+			"release_manifest_file":   schema.StringAttribute{Required: true, Description: "Local installation.json from the immutable qualified release."},
 			"release_manifest_sha256": schema.StringAttribute{Required: true, Description: "SHA-256 of installation.json, recorded on every uploaded Worker version."},
+			"qualification_file":      schema.StringAttribute{Required: true, Description: "Pinned qualification.json for these exact source, artifact, and check inputs."},
+			"qualification_sha256":    schema.StringAttribute{Required: true, Description: "SHA-256 of the independently pinned qualification receipt."},
 			"compatibility_date":      schema.StringAttribute{Computed: true},
 			"compatibility_flags":     schema.SetAttribute{Computed: true, ElementType: types.StringType},
 			"bindings":                schema.SetNestedAttribute{Required: true, NestedObject: schema.NestedAttributeObject{Attributes: workerBindingAttributes()}},
@@ -119,6 +124,9 @@ func (r *workerReleaseResource) ValidateConfig(ctx context.Context, request reso
 	}
 	if !config.ReleaseManifestSHA256.IsUnknown() && !workerSHA256Pattern.MatchString(config.ReleaseManifestSHA256.ValueString()) {
 		response.Diagnostics.AddAttributeError(path.Root("release_manifest_sha256"), "Invalid release digest", "Use the complete lowercase hexadecimal digest from the release manifest.")
+	}
+	if !config.QualificationSHA256.IsUnknown() && !workerSHA256Pattern.MatchString(config.QualificationSHA256.ValueString()) {
+		response.Diagnostics.AddAttributeError(path.Root("qualification_sha256"), "Invalid qualification digest", "Use the complete lowercase hexadecimal qualification receipt digest.")
 	}
 	if !config.TrafficPercentage.IsNull() && !config.TrafficPercentage.IsUnknown() && config.TrafficPercentage.ValueFloat64() != 100 {
 		response.Diagnostics.AddAttributeError(path.Root("traffic_percentage"), "Exclusive deployment required", "A Mechane release must receive 100 percent of traffic.")

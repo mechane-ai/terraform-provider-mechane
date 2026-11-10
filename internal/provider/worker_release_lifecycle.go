@@ -2,7 +2,6 @@ package provider
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +35,7 @@ type workerVersion struct {
 	Modules            []workerModule          `json:"modules"`
 	Limits             workerLimits            `json:"limits"`
 	Annotations        map[string]string       `json:"annotations"`
+	Assets             *workerAssets           `json:"assets,omitempty"`
 }
 
 type workerTraffic struct {
@@ -143,29 +143,54 @@ func (r *workerReleaseResource) findWorkerRelease(ctx context.Context, model wor
 	}
 }
 
-func (r *workerReleaseResource) preserveWorkerNamespaces(ctx context.Context, model workerReleaseModel, config workerReleaseConfiguration) error {
-	pager := r.client.DurableObjects.Namespaces.ListAutoPaging(ctx, durable_objects.NamespaceListParams{AccountID: cloudflare.F(model.AccountID.ValueString())})
-	for pager.Next() {
-		namespace := pager.Current()
-		if namespace.Script != model.WorkerName.ValueString() {
-			continue
+func (r *workerReleaseResource) preserveWorkerNamespaces(ctx context.Context, model workerReleaseModel, config workerReleaseConfiguration) (map[string]string, error) {
+	preserved := map[string]string{}
+	for page := int64(1); ; page++ {
+		namespaces, err := r.client.DurableObjects.Namespaces.List(ctx, durable_objects.NamespaceListParams{AccountID: cloudflare.F(model.AccountID.ValueString()), Page: cloudflare.F(page), PerPage: cloudflare.F(int64(100))})
+		if err != nil {
+			return nil, errors.New(describeCloudflareError(err))
 		}
-		if _, declared := config.Exports[namespace.Class]; !declared {
-			return errors.New("The release omits an existing Durable Object class. Preserve all live classes or perform a separately reviewed migration before applying.")
+		for _, namespace := range namespaces.Result {
+			if namespace.Script != model.WorkerName.ValueString() {
+				continue
+			}
+			if _, declared := config.Exports[namespace.Class]; !declared {
+				return nil, errors.New("The release omits an existing Durable Object class. Preserve all live classes or perform a separately reviewed migration before applying.")
+			}
+			if namespace.ID == "" {
+				return nil, errors.New("Cloudflare did not identify an existing Durable Object namespace.")
+			}
+			preserved[namespace.Class] = namespace.ID
+		}
+		if len(namespaces.Result) == 0 {
+			return preserved, nil
 		}
 	}
-	if err := pager.Err(); err != nil {
-		return errors.New(describeCloudflareError(err))
+}
+
+func verifyWorkerNamespaceIdentities(version workerVersion, preserved map[string]string) error {
+	for _, binding := range version.Bindings {
+		if binding.Type != "durable_object_namespace" || binding.ClassName == nil {
+			continue
+		}
+		if namespace, exists := preserved[*binding.ClassName]; exists && binding.NamespaceID != namespace {
+			return errors.New("The Worker version changed an existing Durable Object namespace identity. Inspect the retained namespace before retrying.")
+		}
 	}
 	return nil
 }
 
-func (r *workerReleaseResource) uploadWorkerRelease(ctx context.Context, model workerReleaseModel, config workerReleaseConfiguration, fingerprint string, content []byte, expectedDeploymentID string) (workerVersion, error) {
+func (r *workerReleaseResource) uploadWorkerRelease(ctx context.Context, model workerReleaseModel, config workerReleaseConfiguration, fingerprint string, artifacts verifiedWorkerArtifacts, expectedDeploymentID string) (workerVersion, error) {
+	completion, err := r.uploadWorkerAssets(ctx, model, artifacts)
+	if err != nil {
+		return workerVersion{}, err
+	}
 	version := workerVersion{
 		MainModule: config.MainModule, CompatibilityDate: config.CompatibilityDate, CompatibilityFlags: config.CompatibilityFlags,
 		Bindings: config.Bindings, Exports: config.Exports, Containers: config.Containers,
 		Limits:      workerLimits{CPUMilliseconds: config.CPUMilliseconds},
-		Modules:     []workerModule{{Name: config.MainModule, ContentType: "application/javascript+module", ContentBase64: base64.StdEncoding.EncodeToString(content)}},
+		Modules:     artifacts.Modules,
+		Assets:      &workerAssets{JWT: completion, Config: config.Assets.Config},
 		Annotations: map[string]string{"workers/tag": "v" + config.ReleaseVersion, "workers/message": workerReleaseMessage(config, fingerprint)},
 	}
 
@@ -181,7 +206,7 @@ func (r *workerReleaseResource) uploadWorkerRelease(ctx context.Context, model w
 		return workerVersion{}, errors.New("The live Worker deployment changed after compatibility preflight. Refresh state and retry before uploading or activating a release.")
 	}
 	var envelope workerEnvelope[workerVersion]
-	err = r.client.Post(ctx, workerVersionPath(model), nil, &envelope, option.WithQuery("deploy", "true"), option.WithRequestBody("application/json", bytes))
+	err = r.client.Post(ctx, workerVersionPath(model), nil, &envelope, option.WithQuery("deploy", "false"), option.WithRequestBody("application/json", bytes))
 	if err == nil && envelope.Success && envelope.Result.ID != "" {
 		version, readErr := r.getWorkerVersion(ctx, model, envelope.Result.ID)
 		if readErr == nil {
@@ -258,14 +283,14 @@ func (r *workerReleaseResource) applyRelease(ctx context.Context, plan workerRel
 	if err = plan.acceptManifest(ctx, manifest); err != nil {
 		return workerReleaseModel{}, err
 	}
-	content, err := readWorkerBundle(plan)
+	if err := verifyWorkerQualification(ctx, plan, manifest); err != nil {
+		return workerReleaseModel{}, err
+	}
+	artifacts, err := readWorkerArtifacts(ctx, plan, manifest)
 	if err != nil {
 		return workerReleaseModel{}, err
 	}
-	if int64(len(content)) != manifest.Worker.Bytes {
-		return workerReleaseModel{}, errors.New("The Worker byte count differs from the verified release manifest.")
-	}
-	config, err := workerConfiguration(ctx, plan)
+	config, err := workerConfiguration(ctx, plan, manifest)
 	if err != nil {
 		return workerReleaseModel{}, err
 	}
@@ -277,7 +302,8 @@ func (r *workerReleaseResource) applyRelease(ctx context.Context, plan workerRel
 	if err != nil {
 		return workerReleaseModel{}, err
 	}
-	if err = r.preserveWorkerNamespaces(ctx, plan, config); err != nil {
+	preserved, err := r.preserveWorkerNamespaces(ctx, plan, config)
+	if err != nil {
 		return workerReleaseModel{}, err
 	}
 	version, found, err := r.findWorkerRelease(ctx, plan, config, fingerprint)
@@ -285,7 +311,7 @@ func (r *workerReleaseResource) applyRelease(ctx context.Context, plan workerRel
 		return workerReleaseModel{}, err
 	}
 	if !found {
-		version, err = r.uploadWorkerRelease(ctx, plan, config, fingerprint, content, expectedDeploymentID)
+		version, err = r.uploadWorkerRelease(ctx, plan, config, fingerprint, artifacts, expectedDeploymentID)
 		if err != nil {
 			return workerReleaseModel{}, err
 		}
@@ -298,10 +324,13 @@ func (r *workerReleaseResource) applyRelease(ctx context.Context, plan workerRel
 	if err != nil || actualFingerprint != fingerprint {
 		return workerReleaseModel{}, errors.New("Cloudflare's uploaded Worker bytes or configuration differ from the release. Inspect the new version before retrying.")
 	}
+	if err := verifyWorkerNamespaceIdentities(version, preserved); err != nil {
+		return workerReleaseModel{}, err
+	}
 	plan.ID = types.StringValue(plan.AccountID.ValueString() + "/" + plan.WorkerName.ValueString())
 	plan.VersionID = types.StringValue(version.ID)
 	plan.DeploymentID = types.StringValue("")
-	if err = plan.readWorkerNamespaces(ctx, version); err != nil {
+	if err = plan.readWorkerNamespaces(ctx, version, false); err != nil {
 		return workerReleaseModel{}, err
 	}
 	deployment, err := r.activateWorkerRelease(ctx, plan, version.ID, expectedDeploymentID)
@@ -309,5 +338,15 @@ func (r *workerReleaseResource) applyRelease(ctx context.Context, plan workerRel
 		return plan, err
 	}
 	plan.readWorkerDeployment(deployment)
+	version, err = r.getWorkerVersion(ctx, plan, version.ID)
+	if err != nil {
+		return plan, errors.New(describeCloudflareError(err))
+	}
+	if err = plan.readWorkerNamespaces(ctx, version, true); err != nil {
+		return plan, err
+	}
+	if err := verifyWorkerNamespaceIdentities(version, preserved); err != nil {
+		return plan, err
+	}
 	return plan, nil
 }

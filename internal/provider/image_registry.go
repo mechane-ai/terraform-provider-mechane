@@ -66,21 +66,21 @@ func readRegistryImage(config imageModel, options []remote.Option) (bool, error)
 }
 
 func (r *containerImageResource) copyImage(ctx context.Context, config imageModel) error {
-	options, err := r.registryOptions(ctx, config.AccountID.ValueString(), true)
-	if err != nil {
-		return err
-	}
-	found, err := readRegistryImage(config, options)
-	if err != nil || found {
-		return err
-	}
-	archive, cleanup, err := downloadImageArchive(ctx, config)
+	archive, cleanup, err := stageImageArchive(ctx, config)
 	if err != nil {
 		return err
 	}
 	defer cleanup()
 	image, err := readArchiveImage(ctx, archive, config.Digest.ValueString())
 	if err != nil {
+		return err
+	}
+	options, err := r.registryOptions(ctx, config.AccountID.ValueString(), true)
+	if err != nil {
+		return err
+	}
+	found, err := readRegistryImage(config, options)
+	if err != nil || found {
 		return err
 	}
 	tagName := "registry.cloudflare.com/" + config.AccountID.ValueString() + "/" + config.Repository.ValueString() + ":sha256-" + strings.TrimPrefix(config.Digest.ValueString(), "sha256:")

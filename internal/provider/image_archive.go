@@ -7,13 +7,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"io"
-	"net/http"
 	"os"
 	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
-	"time"
 
 	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/layout"
@@ -23,26 +21,26 @@ import (
 const maximumArchiveBytes int64 = 8 << 30
 const maximumMetadataBytes int64 = 1 << 20
 
-type archiveReader struct {
+type artifactReader struct {
 	context context.Context
 	reader  io.Reader
 }
 
-func (r archiveReader) Read(buffer []byte) (int, error) {
+func (r artifactReader) Read(buffer []byte) (int, error) {
 	if err := r.context.Err(); err != nil {
 		return 0, err
 	}
 	return r.reader.Read(buffer)
 }
 
-func downloadImageArchive(ctx context.Context, config imageModel) (string, func(), error) {
+func stageImageArchive(ctx context.Context, config imageModel) (string, func(), error) {
 	directory, err := os.MkdirTemp("", "mechane-image-")
 	if err != nil {
 		return "", nil, errors.New("Could not create temporary image storage.")
 	}
 	cleanup := func() { _ = os.RemoveAll(directory) }
 	archivePath := filepath.Join(directory, "image.oci.tar")
-	err = downloadArchive(ctx, config, archivePath)
+	err = copyImageArchive(ctx, config, archivePath)
 	if err != nil {
 		cleanup()
 		return "", nil, err
@@ -50,27 +48,15 @@ func downloadImageArchive(ctx context.Context, config imageModel) (string, func(
 	return archivePath, cleanup, nil
 }
 
-func downloadArchive(ctx context.Context, config imageModel, archivePath string) error {
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, config.SourceURL.ValueString(), nil)
+func copyImageArchive(ctx context.Context, config imageModel, archivePath string) error {
+	source, err := os.Open(config.SourceFile.ValueString())
 	if err != nil {
-		return errors.New("The release archive URL is invalid.")
+		return errors.New("The qualified image archive could not be opened. Restore the candidate bytes before applying.")
 	}
-	client := &http.Client{
-		Timeout: 2 * time.Hour,
-		CheckRedirect: func(request *http.Request, previous []*http.Request) error {
-			if request.URL.Scheme != "https" || len(previous) >= 10 {
-				return errors.New("Release downloads require HTTPS and at most ten redirects.")
-			}
-			return nil
-		},
-	}
-	response, err := client.Do(request)
-	if err != nil {
-		return errors.New("Could not download the release archive. Check the public HTTPS release URL and connectivity.")
-	}
-	defer response.Body.Close()
-	if response.StatusCode != http.StatusOK {
-		return errors.New("The release archive URL did not return HTTP 200.")
+	defer source.Close()
+	info, err := source.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return errors.New("The qualified image archive must be a regular file.")
 	}
 	archive, err := os.OpenFile(archivePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
@@ -78,9 +64,9 @@ func downloadArchive(ctx context.Context, config imageModel, archivePath string)
 	}
 	defer archive.Close()
 	digest := sha256.New()
-	written, err := io.Copy(io.MultiWriter(archive, digest), io.LimitReader(response.Body, maximumArchiveBytes+1))
+	written, err := io.Copy(io.MultiWriter(archive, digest), io.LimitReader(artifactReader{context: ctx, reader: source}, maximumArchiveBytes+1))
 	if err != nil {
-		return errors.New("The release archive download was interrupted.")
+		return errors.New("The qualified image archive copy was interrupted.")
 	}
 	if written > maximumArchiveBytes {
 		return errors.New("The release archive exceeds the 8 GiB installation limit.")
@@ -146,10 +132,10 @@ func unpackArchive(ctx context.Context, archivePath, destination string) error {
 	defer root.Close()
 	archive, err := os.Open(archivePath)
 	if err != nil {
-		return errors.New("Could not open the downloaded image archive.")
+		return errors.New("Could not open the verified image archive.")
 	}
 	defer archive.Close()
-	reader := tar.NewReader(archiveReader{context: ctx, reader: archive})
+	reader := tar.NewReader(artifactReader{context: ctx, reader: archive})
 	blobPath := regexp.MustCompile(`^blobs/sha256/[a-f0-9]{64}$`)
 	var totalBytes int64
 	for {

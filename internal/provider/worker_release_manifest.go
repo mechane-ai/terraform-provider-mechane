@@ -37,12 +37,15 @@ type workerReleaseManifest struct {
 	Repository    string `json:"repository"`
 	PublicCommit  string `json:"public_commit"`
 	Worker        struct {
-		SHA256             string   `json:"sha256"`
-		Bytes              int64    `json:"bytes"`
-		Path               string   `json:"path"`
-		CompatibilityDate  string   `json:"compatibility_date"`
-		CompatibilityFlags []string `json:"compatibility_flags"`
-		ContainerClasses   []string `json:"container_classes"`
+		SHA256             string               `json:"sha256"`
+		Bytes              int64                `json:"bytes"`
+		Path               string               `json:"path"`
+		Modules            []workerArtifact     `json:"modules"`
+		Assets             *workerAssetManifest `json:"assets"`
+		Triggers           *workerTriggers      `json:"triggers"`
+		CompatibilityDate  string               `json:"compatibility_date"`
+		CompatibilityFlags []string             `json:"compatibility_flags"`
+		ContainerClasses   []string             `json:"container_classes"`
 		Bindings           []struct {
 			Name      string `json:"name"`
 			ClassName string `json:"class_name"`
@@ -52,10 +55,37 @@ type workerReleaseManifest struct {
 	Formats workerFormats `json:"formats"`
 }
 
+type workerTriggers struct {
+	Crons []string `json:"crons"`
+}
+
 type workerReleaseMarker struct {
-	SourceRevision string
-	Fingerprint    string
-	ManifestSHA256 string
+	SourceRevision      string
+	Fingerprint         string
+	ManifestSHA256      string
+	AssetsSHA256        string
+	QualificationSHA256 string
+}
+
+type workerArtifact struct {
+	Path        string `json:"path"`
+	ContentType string `json:"content_type"`
+	SHA256      string `json:"sha256"`
+	Bytes       int64  `json:"bytes"`
+}
+
+type workerAssetManifest struct {
+	Directory string            `json:"directory"`
+	Binding   string            `json:"binding"`
+	Files     []workerArtifact  `json:"files"`
+	Config    workerAssetConfig `json:"config"`
+}
+
+type workerAssetConfig struct {
+	BasePath         string `json:"base_path,omitempty"`
+	HTMLHandling     string `json:"html_handling"`
+	NotFoundHandling string `json:"not_found_handling"`
+	RunWorkerFirst   bool   `json:"run_worker_first"`
 }
 
 func parseWorkerReleaseVersion(value string) (*version.Version, error) {
@@ -69,14 +99,22 @@ func parseWorkerReleaseVersion(value string) (*version.Version, error) {
 }
 
 func parseWorkerReleaseMarker(message string) (workerReleaseMarker, bool, error) {
-	if !strings.HasPrefix(message, "mechane:") {
+	if !strings.HasPrefix(message, "mechane:") && !strings.HasPrefix(message, "mechane2:") {
 		return workerReleaseMarker{}, false, nil
 	}
 	parts := strings.Split(message, ":")
-	if len(parts) != 4 || !workerRevisionPattern.MatchString(parts[1]) || !workerSHA256Pattern.MatchString(parts[2]) || !workerSHA256Pattern.MatchString(parts[3]) {
+	if (parts[0] == "mechane" && len(parts) != 4) || (parts[0] == "mechane2" && len(parts) != 6) || !workerRevisionPattern.MatchString(parts[1]) || !workerSHA256Pattern.MatchString(parts[2]) || !workerSHA256Pattern.MatchString(parts[3]) {
 		return workerReleaseMarker{}, true, errors.New("The live Worker has malformed native release metadata.")
 	}
-	return workerReleaseMarker{SourceRevision: parts[1], Fingerprint: parts[2], ManifestSHA256: parts[3]}, true, nil
+	marker := workerReleaseMarker{SourceRevision: parts[1], Fingerprint: parts[2], ManifestSHA256: parts[3]}
+	if parts[0] == "mechane2" {
+		if !workerSHA256Pattern.MatchString(parts[4]) || !workerSHA256Pattern.MatchString(parts[5]) {
+			return workerReleaseMarker{}, true, errors.New("The live Worker has malformed asset or qualification metadata.")
+		}
+		marker.AssetsSHA256 = parts[4]
+		marker.QualificationSHA256 = parts[5]
+	}
+	return marker, true, nil
 }
 
 func validateWorkerFormats(formats workerFormats) error {
@@ -105,8 +143,8 @@ func decodeWorkerManifest(content []byte) (workerReleaseManifest, error) {
 	if json.Unmarshal(content, &manifest) != nil {
 		return manifest, errors.New("The installation manifest is not valid release metadata.")
 	}
-	if manifest.FormatVersion != 1 || manifest.IsPreview == nil || *manifest.IsPreview {
-		return manifest, errors.New("Use a published, non-preview installation manifest with format_version 1.")
+	if (manifest.FormatVersion != 1 && manifest.FormatVersion != 2) || manifest.IsPreview == nil || *manifest.IsPreview {
+		return manifest, errors.New("Use a non-preview installation manifest with a supported format version.")
 	}
 	if !workerRepositoryPattern.MatchString(manifest.Repository) || !workerRevisionPattern.MatchString(manifest.PublicCommit) || !workerSHA256Pattern.MatchString(manifest.Worker.SHA256) {
 		return manifest, errors.New("The installation manifest must identify a public repository, full source revision, and Worker SHA-256.")
@@ -140,6 +178,12 @@ func readWorkerManifest(model workerReleaseModel) (workerReleaseManifest, error)
 	}
 	manifest, err := decodeWorkerManifest(content)
 	if err != nil {
+		return manifest, err
+	}
+	if manifest.FormatVersion != 2 {
+		return manifest, errors.New("New Worker releases require installation format_version 2 and digest-bound qualification.")
+	}
+	if err := validateWorkerArtifacts(manifest); err != nil {
 		return manifest, err
 	}
 	if manifest.Worker.Path != "worker.js" || manifest.Worker.Bytes <= 0 || manifest.Worker.CompatibilityDate == "" || manifest.Worker.CompatibilityFlags == nil || manifest.Worker.ContainerClasses == nil || len(manifest.Worker.Bindings) == 0 || len(manifest.Worker.Exports) == 0 {

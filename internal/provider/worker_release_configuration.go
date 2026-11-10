@@ -8,8 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"slices"
 	"strings"
 
@@ -68,9 +66,17 @@ type workerReleaseConfiguration struct {
 	ReleaseVersion        string                  `json:"release_version"`
 	SourceRevision        string                  `json:"source_revision"`
 	ReleaseManifestSHA256 string                  `json:"release_manifest_sha256"`
+	Modules               []workerArtifact        `json:"modules,omitempty"`
+	Assets                *workerReleaseAssets    `json:"assets,omitempty"`
+	QualificationSHA256   string                  `json:"qualification_sha256,omitempty"`
 }
 
-func workerConfiguration(ctx context.Context, model workerReleaseModel) (workerReleaseConfiguration, error) {
+type workerReleaseAssets struct {
+	SHA256 string            `json:"sha256"`
+	Config workerAssetConfig `json:"config"`
+}
+
+func workerConfiguration(ctx context.Context, model workerReleaseModel, manifest workerReleaseManifest) (workerReleaseConfiguration, error) {
 	config := workerReleaseConfiguration{
 		BundleSHA256: model.BundleSHA256.ValueString(), MainModule: "worker.js",
 		CompatibilityDate: model.CompatibilityDate.ValueString(), CompatibilityFlags: []string{},
@@ -78,7 +84,13 @@ func workerConfiguration(ctx context.Context, model workerReleaseModel) (workerR
 		CPUMilliseconds: model.CPUMilliseconds.ValueInt64(),
 		ReleaseVersion:  model.ReleaseVersion.ValueString(), SourceRevision: model.SourceRevision.ValueString(),
 		ReleaseManifestSHA256: model.ReleaseManifestSHA256.ValueString(),
+		Modules:               slices.Clone(manifest.Worker.Modules), QualificationSHA256: model.QualificationSHA256.ValueString(),
 	}
+	assetsDigest, err := workerAssetsDigest(*manifest.Worker.Assets)
+	if err != nil {
+		return config, err
+	}
+	config.Assets = &workerReleaseAssets{SHA256: assetsDigest, Config: manifest.Worker.Assets.Config}
 	var bindings []workerBindingModel
 	if diagnostics := model.Bindings.ElementsAs(ctx, &bindings, false); diagnostics.HasError() {
 		return config, errors.New("Worker bindings must be fully known before applying.")
@@ -105,6 +117,10 @@ func workerConfiguration(ctx context.Context, model workerReleaseModel) (workerR
 		}
 		config.Bindings = append(config.Bindings, value)
 	}
+	if seen[manifest.Worker.Assets.Binding] {
+		return config, errors.New("Installation bindings cannot replace the release-owned ASSETS binding.")
+	}
+	config.Bindings = append(config.Bindings, workerBinding{Name: manifest.Worker.Assets.Binding, Type: "assets"})
 	var exports map[string]workerExportModel
 	if diagnostics := model.Exports.ElementsAs(ctx, &exports, false); diagnostics.HasError() {
 		return config, errors.New("Worker exports must be fully known before applying.")
@@ -150,6 +166,8 @@ func workerConfiguration(ctx context.Context, model workerReleaseModel) (workerR
 func validateWorkerBinding(binding workerBinding) error {
 	valid := false
 	switch binding.Type {
+	case "assets":
+		valid = binding.Text == nil && binding.ClassName == nil && binding.BucketName == nil && binding.Jurisdiction == nil && binding.StoreID == nil && binding.SecretName == nil
 	case "plain_text":
 		valid = binding.Text != nil && binding.ClassName == nil && binding.BucketName == nil && binding.Jurisdiction == nil && binding.StoreID == nil && binding.SecretName == nil
 	case "durable_object_namespace":
@@ -166,6 +184,9 @@ func validateWorkerBinding(binding workerBinding) error {
 }
 
 func (config *workerReleaseConfiguration) normalize() {
+	if config.Assets != nil && config.Assets.Config.BasePath == "/" {
+		config.Assets.Config.BasePath = ""
+	}
 	if config.CompatibilityFlags == nil {
 		config.CompatibilityFlags = []string{}
 	}
@@ -184,6 +205,7 @@ func (config *workerReleaseConfiguration) normalize() {
 	}
 	slices.SortFunc(config.Bindings, func(a, b workerBinding) int { return strings.Compare(a.Name, b.Name) })
 	slices.SortFunc(config.Containers, func(a, b workerContainer) int { return strings.Compare(a.ClassName, b.ClassName) })
+	slices.SortFunc(config.Modules, func(a, b workerArtifact) int { return strings.Compare(a.Path, b.Path) })
 	for name, export := range config.Exports {
 		if export.State == "" {
 			export.State = "created"
@@ -203,23 +225,6 @@ func (config workerReleaseConfiguration) fingerprint() (string, error) {
 func workerDigest(content []byte) string {
 	digest := sha256.Sum256(content)
 	return hex.EncodeToString(digest[:])
-}
-
-func readWorkerBundle(model workerReleaseModel) ([]byte, error) {
-	file, err := os.Open(model.BundleFile.ValueString())
-	if err != nil {
-		return nil, errors.New("The release bundle could not be opened. Restore the immutable release artifact and retry.")
-	}
-	defer file.Close()
-	const maximumBundleBytes = 64 * 1024 * 1024
-	content, err := io.ReadAll(io.LimitReader(file, maximumBundleBytes+1))
-	if err != nil || len(content) > maximumBundleBytes {
-		return nil, errors.New("The release bundle is unreadable or exceeds 64 MiB.")
-	}
-	if workerDigest(content) != model.BundleSHA256.ValueString() {
-		return nil, errors.New("The release bundle does not match bundle_sha256. Restore the immutable release artifact before applying.")
-	}
-	return content, nil
 }
 
 func workerBindingObjectType() types.ObjectType {
@@ -247,6 +252,9 @@ func (model *workerReleaseModel) readWorkerVersion(ctx context.Context, version 
 	model.ReleaseVersion = types.StringValue(config.ReleaseVersion)
 	model.SourceRevision = types.StringValue(config.SourceRevision)
 	model.ReleaseManifestSHA256 = types.StringValue(config.ReleaseManifestSHA256)
+	if config.QualificationSHA256 != "" {
+		model.QualificationSHA256 = types.StringValue(config.QualificationSHA256)
+	}
 	flags, diagnostics := types.SetValueFrom(ctx, types.StringType, config.CompatibilityFlags)
 	if diagnostics.HasError() {
 		return errors.New("The Worker compatibility flags could not be decoded.")
@@ -255,6 +263,9 @@ func (model *workerReleaseModel) readWorkerVersion(ctx context.Context, version 
 	bindings := []workerBindingModel{}
 	durableBindings := []workerBindingModel{}
 	for _, binding := range config.Bindings {
+		if binding.Type == "assets" {
+			continue
+		}
 		text := types.StringNull()
 		if binding.Type == "plain_text" {
 			text = types.StringPointerValue(binding.Text)
@@ -295,16 +306,22 @@ func (model *workerReleaseModel) readWorkerVersion(ctx context.Context, version 
 	if diagnostics.HasError() {
 		return errors.New("The Worker container metadata could not be decoded.")
 	}
-	return model.readWorkerNamespaces(ctx, version)
+	return model.readWorkerNamespaces(ctx, version, false)
 }
 
-func (model *workerReleaseModel) readWorkerNamespaces(ctx context.Context, version workerVersion) error {
+func (model *workerReleaseModel) readWorkerNamespaces(ctx context.Context, version workerVersion, requireAssigned bool) error {
 	namespaces := map[string]string{}
 	for _, binding := range version.Bindings {
 		if binding.Type != "durable_object_namespace" {
 			continue
 		}
-		if binding.ClassName == nil || binding.NamespaceID == "" {
+		if binding.ClassName == nil {
+			return errors.New("Cloudflare did not return a class name for a Durable Object binding.")
+		}
+		if binding.NamespaceID == "" && !requireAssigned {
+			continue
+		}
+		if binding.NamespaceID == "" {
 			return errors.New("Cloudflare did not return a namespace ID for a bound Durable Object class.")
 		}
 		if previous, found := namespaces[*binding.ClassName]; found && previous != binding.NamespaceID {
@@ -326,14 +343,6 @@ func (version workerVersion) configuration() (workerReleaseConfiguration, error)
 		Bindings: slices.Clone(version.Bindings), Exports: version.Exports, Containers: slices.Clone(version.Containers),
 		CPUMilliseconds: version.Limits.CPUMilliseconds, ReleaseVersion: strings.TrimPrefix(version.Annotations["workers/tag"], "v"),
 	}
-	if version.ID == "" || len(version.Modules) != 1 || version.Modules[0].Name != version.MainModule {
-		return config, errors.New("The Worker version must contain exactly one main module.")
-	}
-	content, err := base64.StdEncoding.DecodeString(version.Modules[0].ContentBase64)
-	if err != nil {
-		return config, errors.New("The Worker main module could not be decoded.")
-	}
-	config.BundleSHA256 = workerDigest(content)
 	marker, marked, err := parseWorkerReleaseMarker(version.Annotations["workers/message"])
 	if err != nil {
 		return config, err
@@ -342,10 +351,43 @@ func (version workerVersion) configuration() (workerReleaseConfiguration, error)
 		config.SourceRevision = marker.SourceRevision
 		config.ReleaseManifestSHA256 = marker.ManifestSHA256
 	}
+	if version.ID == "" || len(version.Modules) == 0 {
+		return config, errors.New("The Worker version did not return its uploaded modules.")
+	}
+	seen := map[string]bool{}
+	for _, module := range version.Modules {
+		if seen[module.Name] || !validWorkerArtifactPath(module.Name) {
+			return config, errors.New("The Worker version has invalid or duplicate module names.")
+		}
+		seen[module.Name] = true
+		content, err := base64.StdEncoding.DecodeString(module.ContentBase64)
+		if err != nil {
+			return config, errors.New("A Worker module could not be decoded.")
+		}
+		if module.Name == version.MainModule {
+			config.BundleSHA256 = workerDigest(content)
+		}
+		if marker.QualificationSHA256 != "" {
+			config.Modules = append(config.Modules, workerArtifact{Path: module.Name, ContentType: module.ContentType, SHA256: workerDigest(content), Bytes: int64(len(content))})
+		}
+	}
+	if config.BundleSHA256 == "" || (marker.QualificationSHA256 == "" && len(version.Modules) != 1) {
+		return config, errors.New("The Worker version's main module or release metadata is incomplete.")
+	}
+	if marker.QualificationSHA256 != "" {
+		if version.Assets == nil || marker.AssetsSHA256 == "" {
+			return config, errors.New("The qualified Worker version did not return its asset configuration.")
+		}
+		config.Assets = &workerReleaseAssets{SHA256: marker.AssetsSHA256, Config: version.Assets.Config}
+		config.QualificationSHA256 = marker.QualificationSHA256
+	}
 	config.normalize()
 	return config, nil
 }
 
 func workerReleaseMessage(config workerReleaseConfiguration, fingerprint string) string {
+	if config.Assets != nil {
+		return fmt.Sprintf("mechane2:%s:%s:%s:%s:%s", config.SourceRevision, fingerprint, config.ReleaseManifestSHA256, config.Assets.SHA256, config.QualificationSHA256)
+	}
 	return fmt.Sprintf("mechane:%s:%s:%s", config.SourceRevision, fingerprint, config.ReleaseManifestSHA256)
 }

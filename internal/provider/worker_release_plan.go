@@ -35,6 +35,12 @@ func (r *workerReleaseResource) ModifyPlan(ctx context.Context, request resource
 		response.Diagnostics.AddError("Read release manifest", err.Error())
 		return
 	}
+	if !plan.QualificationFile.IsUnknown() && !plan.QualificationFile.IsNull() && !plan.QualificationSHA256.IsUnknown() && !plan.QualificationSHA256.IsNull() {
+		if err := verifyWorkerQualification(ctx, plan, manifest); err != nil {
+			response.Diagnostics.AddError("Verify release qualification", err.Error())
+			return
+		}
+	}
 	response.Diagnostics.Append(response.Plan.Set(ctx, &plan)...)
 	if request.State.Raw.IsNull() || response.Diagnostics.HasError() {
 		return

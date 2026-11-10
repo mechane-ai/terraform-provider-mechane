@@ -3,7 +3,6 @@ package provider
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -25,7 +24,7 @@ type containerImageResource struct {
 type imageModel struct {
 	AccountID               types.String `tfsdk:"account_id"`
 	Repository              types.String `tfsdk:"repository"`
-	SourceURL               types.String `tfsdk:"source_url"`
+	SourceFile              types.String `tfsdk:"source_file"`
 	SourceSHA256            types.String `tfsdk:"source_sha256"`
 	Digest                  types.String `tfsdk:"digest"`
 	OperationTimeoutSeconds types.Int64  `tfsdk:"operation_timeout_seconds"`
@@ -44,11 +43,12 @@ func (r *containerImageResource) Metadata(_ context.Context, request resource.Me
 func (r *containerImageResource) Schema(_ context.Context, _ resource.SchemaRequest, response *resource.SchemaResponse) {
 	immutable := []planmodifier.String{stringplanmodifier.RequiresReplace()}
 	response.Schema = schema.Schema{
+		Version:     1,
 		Description: "Copies a verified OCI release archive into the account's Cloudflare registry without Docker. Removal forgets ownership and retains the immutable image for running applications and rollback.",
 		Attributes: map[string]schema.Attribute{
 			"account_id":                schema.StringAttribute{Required: true, PlanModifiers: immutable},
 			"repository":                schema.StringAttribute{Required: true, PlanModifiers: immutable},
-			"source_url":                schema.StringAttribute{Required: true, Description: "Public HTTPS URL for the uncompressed OCI layout tar archive."},
+			"source_file":               schema.StringAttribute{Required: true, Description: "Local qualified uncompressed OCI layout tar archive. The provider never rebuilds or downloads it."},
 			"source_sha256":             schema.StringAttribute{Required: true, Description: "SHA-256 of the complete release archive, in lowercase hexadecimal."},
 			"digest":                    schema.StringAttribute{Required: true, PlanModifiers: immutable, Description: "sha256 digest of the Linux amd64 image manifest inside the archive."},
 			"operation_timeout_seconds": schema.Int64Attribute{Optional: true, Computed: true, Default: int64default.StaticInt64(2400)},
@@ -76,11 +76,8 @@ func (r *containerImageResource) ValidateConfig(ctx context.Context, request res
 	if response.Diagnostics.HasError() {
 		return
 	}
-	if !config.SourceURL.IsUnknown() {
-		parsed, err := url.Parse(config.SourceURL.ValueString())
-		if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
-			response.Diagnostics.AddAttributeError(path.Root("source_url"), "Invalid release archive URL", "Use a public HTTPS URL without credentials, query parameters, or a fragment.")
-		}
+	if !config.SourceFile.IsUnknown() && config.SourceFile.ValueString() == "" {
+		response.Diagnostics.AddAttributeError(path.Root("source_file"), "Missing release archive", "Supply the local OCI archive from the qualified candidate directory.")
 	}
 	for _, field := range []struct {
 		name    string
