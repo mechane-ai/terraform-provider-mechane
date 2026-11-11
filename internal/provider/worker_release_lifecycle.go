@@ -180,7 +180,20 @@ func verifyWorkerNamespaceIdentities(version workerVersion, preserved map[string
 	return nil
 }
 
-func (r *workerReleaseResource) uploadWorkerRelease(ctx context.Context, model workerReleaseModel, config workerReleaseConfiguration, fingerprint string, artifacts verifiedWorkerArtifacts, expectedDeploymentID string) (workerVersion, error) {
+func workerRequiresNamespaceCreation(config workerReleaseConfiguration, preserved map[string]string) bool {
+	for _, binding := range config.Bindings {
+		if binding.Type != "durable_object_namespace" || binding.ClassName == nil {
+			continue
+		}
+		class := *binding.ClassName
+		if config.Exports[class].State == "created" && preserved[class] == "" {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *workerReleaseResource) uploadWorkerRelease(ctx context.Context, model workerReleaseModel, config workerReleaseConfiguration, fingerprint string, artifacts verifiedWorkerArtifacts, expectedDeploymentID string, deploy bool) (workerVersion, error) {
 	completion, err := r.uploadWorkerAssets(ctx, model, artifacts)
 	if err != nil {
 		return workerVersion{}, err
@@ -206,12 +219,14 @@ func (r *workerReleaseResource) uploadWorkerRelease(ctx context.Context, model w
 		return workerVersion{}, errors.New("The live Worker deployment changed after compatibility preflight. Refresh state and retry before uploading or activating a release.")
 	}
 	var envelope workerEnvelope[workerVersion]
-	err = r.client.Post(ctx, workerVersionPath(model), nil, &envelope, option.WithQuery("deploy", "false"), option.WithRequestBody("application/json", bytes))
+	// Cloudflare cannot bind a new class until its export is reconciled by deployment.
+	err = r.client.Post(ctx, workerVersionPath(model), nil, &envelope, option.WithQuery("deploy", fmt.Sprint(deploy)), option.WithRequestBody("application/json", bytes))
 	if err == nil && envelope.Success && envelope.Result.ID != "" {
 		version, readErr := r.getWorkerVersion(ctx, model, envelope.Result.ID)
-		if readErr == nil {
-			return version, nil
+		if readErr != nil {
+			return envelope.Result, errors.New(describeCloudflareError(readErr))
 		}
+		return version, nil
 	}
 	var apiError *cloudflare.Error
 	if errors.As(err, &apiError) && apiError.StatusCode >= 400 && apiError.StatusCode < 500 && apiError.StatusCode != 408 {
@@ -254,11 +269,15 @@ func (r *workerReleaseResource) activateWorkerRelease(ctx context.Context, model
 	}
 	var envelope workerEnvelope[workerDeployment]
 	postError := r.client.Post(ctx, workerDeploymentPath(model), nil, &envelope, option.WithRequestBody("application/json", bytes))
+	return r.confirmWorkerActivation(ctx, model, versionID, postError)
+}
+
+func (r *workerReleaseResource) confirmWorkerActivation(ctx context.Context, model workerReleaseModel, versionID string, postError error) (workerDeployment, error) {
 	// Activation can be accepted before the read endpoint reflects it. Reconcile reads, never repeat the POST.
 	confirmation, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	for {
-		current, err = r.getWorkerDeployment(confirmation, model)
+		current, err := r.getWorkerDeployment(confirmation, model)
 		if err == nil && len(current.Versions) == 1 && current.Versions[0].VersionID == versionID && current.Versions[0].Percentage == 100 {
 			return current, nil
 		}
@@ -310,30 +329,51 @@ func (r *workerReleaseResource) applyRelease(ctx context.Context, plan workerRel
 	if err != nil {
 		return workerReleaseModel{}, err
 	}
+	deployOnUpload := !found && workerRequiresNamespaceCreation(config, preserved)
 	if !found {
-		version, err = r.uploadWorkerRelease(ctx, plan, config, fingerprint, artifacts, expectedDeploymentID)
-		if err != nil {
+		version, err = r.uploadWorkerRelease(ctx, plan, config, fingerprint, artifacts, expectedDeploymentID, deployOnUpload)
+	}
+	if version.ID != "" {
+		plan.ID = types.StringValue(plan.AccountID.ValueString() + "/" + plan.WorkerName.ValueString())
+		plan.VersionID = types.StringValue(version.ID)
+		plan.DeploymentID = types.StringNull()
+		plan.TrafficPercentage = types.Float64Null()
+		plan.DurableObjectNamespaces = types.MapNull(types.StringType)
+		if namespaceErr := plan.readWorkerNamespaces(ctx, version, false); namespaceErr != nil && err == nil {
+			err = namespaceErr
+		}
+		if deployOnUpload {
+			deployment, readErr := r.getWorkerDeployment(ctx, plan)
+			if readErr == nil {
+				plan.readWorkerDeployment(deployment)
+			} else if err == nil {
+				err = errors.New(describeCloudflareError(readErr))
+			}
+		}
+	}
+	if err != nil {
+		if version.ID == "" {
 			return workerReleaseModel{}, err
 		}
+		return plan, err
 	}
 	actual, err := version.configuration()
 	if err != nil {
-		return workerReleaseModel{}, err
+		return plan, err
 	}
 	actualFingerprint, err := actual.fingerprint()
 	if err != nil || actualFingerprint != fingerprint {
-		return workerReleaseModel{}, errors.New("Cloudflare's uploaded Worker bytes or configuration differ from the release. Inspect the new version before retrying.")
+		return plan, errors.New("Cloudflare's uploaded Worker bytes or configuration differ from the release. Inspect the new version before retrying.")
 	}
 	if err := verifyWorkerNamespaceIdentities(version, preserved); err != nil {
-		return workerReleaseModel{}, err
+		return plan, err
 	}
-	plan.ID = types.StringValue(plan.AccountID.ValueString() + "/" + plan.WorkerName.ValueString())
-	plan.VersionID = types.StringValue(version.ID)
-	plan.DeploymentID = types.StringValue("")
-	if err = plan.readWorkerNamespaces(ctx, version, false); err != nil {
-		return workerReleaseModel{}, err
+	var deployment workerDeployment
+	if deployOnUpload {
+		deployment, err = r.confirmWorkerActivation(ctx, plan, version.ID, nil)
+	} else {
+		deployment, err = r.activateWorkerRelease(ctx, plan, version.ID, expectedDeploymentID)
 	}
-	deployment, err := r.activateWorkerRelease(ctx, plan, version.ID, expectedDeploymentID)
 	if err != nil {
 		return plan, err
 	}

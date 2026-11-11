@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"time"
 
 	"github.com/cloudflare/cloudflare-go/v7"
@@ -86,6 +87,8 @@ func (p *mechaneProvider) DataSources(_ context.Context) []func() datasource.Dat
 	return nil
 }
 
+var cloudflareRayPattern = regexp.MustCompile(`^[0-9a-f]{16,32}(-[A-Z]{3})?$`)
+
 func describeCloudflareError(err error) string {
 	var apiError *cloudflare.Error
 	if errors.As(err, &apiError) {
@@ -93,7 +96,17 @@ func describeCloudflareError(err error) string {
 		for _, failure := range apiError.Errors {
 			codes = append(codes, failure.Code)
 		}
-		return fmt.Sprintf("Cloudflare returned HTTP %d with error codes %v. Check those codes and the account's Cloudflare diagnostics before retrying.", apiError.StatusCode, codes)
+		operation := "Cloudflare request"
+		if apiError.Request != nil && apiError.Request.URL != nil {
+			operation = fmt.Sprintf("Cloudflare %s %q", apiError.Request.Method, apiError.Request.URL.EscapedPath())
+		}
+		message := fmt.Sprintf("%s returned HTTP %d with error codes %v.", operation, apiError.StatusCode, codes)
+		if apiError.Response != nil {
+			if ray := apiError.Response.Header.Get("CF-Ray"); cloudflareRayPattern.MatchString(ray) {
+				message += " CF-Ray: " + ray + "."
+			}
+		}
+		return message + " Check the account's Cloudflare diagnostics before retrying."
 	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return "The operation deadline expired. Refresh state and retry to resume the existing operation."

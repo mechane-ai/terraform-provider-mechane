@@ -112,6 +112,13 @@ type workerCloudflareFixture struct {
 	MissingCompletion      bool
 	UnexpectedClass        bool
 	RebindSandboxNamespace bool
+	MechNamespaceExists    bool
+	FailVersionRead        bool
+	FailDeploymentRead     bool
+	LoseVersionResponse    bool
+	VersionUploads         int
+	DeploymentWrites       int
+	StaleActivationReads   int
 }
 
 func workerFixtureClient(t *testing.T, state *workerCloudflareFixture) *workerReleaseResource {
@@ -178,11 +185,16 @@ func workerFixtureClient(t *testing.T, state *workerCloudflareFixture) *workerRe
 			if state.UnexpectedClass {
 				class = "RetainedHistoryObject"
 			}
-			result = []map[string]string{{"id": "existing-sandbox-namespace", "class": class, "script": "retained-worker"}}
+			namespaces := []map[string]string{{"id": "existing-sandbox-namespace", "class": class, "script": "retained-worker"}}
+			if state.MechNamespaceExists {
+				namespaces = append(namespaces, map[string]string{"id": "namespace-MechObject", "class": "MechObject", "script": "retained-worker"})
+			}
+			result = namespaces
 			if request.URL.Query().Get("page") == "2" {
 				result = []map[string]string{}
 			}
 		case strings.HasSuffix(path, "/deployments") && request.Method == http.MethodPost:
+			state.DeploymentWrites++
 			if err := json.NewDecoder(request.Body).Decode(&state.Deployment); err != nil {
 				t.Error(err)
 			}
@@ -192,20 +204,34 @@ func workerFixtureClient(t *testing.T, state *workerCloudflareFixture) *workerRe
 					state.Version.Bindings[index].NamespaceID = "namespace-" + *state.Version.Bindings[index].ClassName
 				}
 			}
+			state.MechNamespaceExists = true
 			result = state.Deployment
 		case strings.HasSuffix(path, "/deployments"):
+			if state.Version != nil && state.FailDeploymentRead {
+				response.WriteHeader(http.StatusForbidden)
+				_, _ = io.WriteString(response, `{"success":false,"errors":[{"code":10000,"message":"private-error-sentinel"}]}`)
+				return
+			}
 			deployments := []workerDeployment{}
-			if state.Deployment.ID != "" {
+			if state.Version != nil && state.StaleActivationReads > 0 {
+				state.StaleActivationReads--
+			} else if state.Deployment.ID != "" {
 				deployments = append(deployments, state.Deployment)
 			}
 			result = map[string]any{"deployments": deployments}
 		case strings.HasSuffix(path, "/versions") && request.Method == http.MethodPost:
-			if request.URL.Query().Get("deploy") != "false" {
-				t.Error("version upload must leave activation to the deployment writer")
-			}
+			state.VersionUploads++
+			deploy := request.URL.Query().Get("deploy") == "true"
 			var version workerVersion
 			if err := json.NewDecoder(request.Body).Decode(&version); err != nil {
 				t.Error(err)
+			}
+			for _, binding := range version.Bindings {
+				if binding.Type == "durable_object_namespace" && *binding.ClassName == "MechObject" && !state.MechNamespaceExists && !deploy {
+					response.WriteHeader(http.StatusForbidden)
+					_, _ = io.WriteString(response, `{"success":false,"errors":[{"code":100406,"message":"Actor binding requires a provisioned namespace"}]}`)
+					return
+				}
 			}
 			if version.Assets == nil || version.Assets.JWT != "completion-token" {
 				t.Error("version did not attach confirmed assets")
@@ -218,13 +244,34 @@ func workerFixtureClient(t *testing.T, state *workerCloudflareFixture) *workerRe
 						version.Bindings[index].NamespaceID = "replacement-sandbox-namespace"
 					}
 				}
+				if version.Bindings[index].Type == "durable_object_namespace" && *version.Bindings[index].ClassName == "MechObject" && (state.MechNamespaceExists || deploy) {
+					version.Bindings[index].NamespaceID = "namespace-MechObject"
+				}
 			}
 			state.Version = &version
+			if deploy {
+				state.Deployment = workerDeployment{ID: "deployment", Versions: []workerTraffic{{VersionID: version.ID, Percentage: 100}}}
+				state.MechNamespaceExists = true
+			}
+			if state.LoseVersionResponse {
+				response.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(response, `{"success":false,"errors":[{"code":10000,"message":"Response lost after acceptance"}]}`)
+				return
+			}
 			result = version
 		case strings.HasSuffix(path, "/versions/version"):
+			if state.FailVersionRead {
+				response.Header().Set("CF-Ray", "0123456789abcdef-SJC")
+				response.WriteHeader(http.StatusForbidden)
+				_, _ = io.WriteString(response, `{"success":false,"errors":[{"code":10000,"message":"private-error-sentinel"}]}`)
+				return
+			}
 			result = state.Version
 		case strings.HasSuffix(path, "/versions"):
 			result = []workerVersion{}
+			if state.Version != nil {
+				result = []workerVersion{*state.Version}
+			}
 		default:
 			t.Errorf("unexpected fixture request %s %s", request.Method, path)
 			response.WriteHeader(http.StatusNotFound)
@@ -276,7 +323,7 @@ func TestWorkerReleaseUploadsQualifiedModulesAndAssets(t *testing.T) {
 
 func TestWorkerReleaseRefusesExistingNamespaceRebinding(t *testing.T) {
 	fixture := newWorkerReleaseFixture(t)
-	state := &workerCloudflareFixture{RebindSandboxNamespace: true}
+	state := &workerCloudflareFixture{RebindSandboxNamespace: true, MechNamespaceExists: true}
 	resource := workerFixtureClient(t, state)
 	if _, err := resource.applyRelease(context.Background(), fixture.Model); err == nil {
 		t.Fatal("a changed Sandbox namespace identity was accepted")
@@ -285,6 +332,55 @@ func TestWorkerReleaseRefusesExistingNamespaceRebinding(t *testing.T) {
 	defer state.Mutex.Unlock()
 	if state.Deployment.ID != "" {
 		t.Fatal("a changed Sandbox namespace identity was activated")
+	}
+}
+
+func TestWorkerReleaseRetainsAcceptedActivationAfterReadFailure(t *testing.T) {
+	for _, scenario := range []struct {
+		name                string
+		deploymentReadFails bool
+	}{{"observed deployment", false}, {"unobserved deployment", true}} {
+		t.Run(scenario.name, func(t *testing.T) {
+			fixture := newWorkerReleaseFixture(t)
+			fixture.Model.DurableObjectNamespaces = types.MapUnknown(types.StringType)
+			state := &workerCloudflareFixture{FailVersionRead: true, FailDeploymentRead: scenario.deploymentReadFails}
+			resource := workerFixtureClient(t, state)
+			result, err := resource.applyRelease(context.Background(), fixture.Model)
+			if err == nil || result.VersionID.ValueString() != "version" {
+				t.Fatal("accepted version was lost when its follow-up read failed")
+			}
+			if scenario.deploymentReadFails {
+				if !result.DeploymentID.IsNull() || !result.TrafficPercentage.IsNull() {
+					t.Fatal("an unobserved deployment was recorded as absent or active")
+				}
+			} else if result.DeploymentID.ValueString() != "deployment" || result.TrafficPercentage.ValueFloat64() != 100 {
+				t.Fatal("observed activation was lost when its version read failed")
+			}
+			if strings.Contains(err.Error(), "private-error-sentinel") {
+				t.Fatal("Cloudflare response details reached the provider diagnostic")
+			}
+			if result.DurableObjectNamespaces.IsUnknown() {
+				t.Fatal("accepted activation returned unknown namespace state")
+			}
+		})
+	}
+}
+
+func TestWorkerReleaseReconcilesUncertainActivationWithoutRepeatingUpload(t *testing.T) {
+	fixture := newWorkerReleaseFixture(t)
+	state := &workerCloudflareFixture{LoseVersionResponse: true, StaleActivationReads: 2}
+	resource := workerFixtureClient(t, state)
+	result, err := resource.applyRelease(context.Background(), fixture.Model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TrafficPercentage.ValueFloat64() != 100 {
+		t.Fatal("an accepted activation was not reconciled")
+	}
+	state.Mutex.Lock()
+	defer state.Mutex.Unlock()
+	if state.VersionUploads != 1 || state.DeploymentWrites != 0 {
+		t.Fatal("an uncertain atomic activation repeated its upload or deployment")
 	}
 }
 
