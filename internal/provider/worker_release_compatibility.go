@@ -8,23 +8,18 @@ import (
 )
 
 func preserveWorkerFormats(previous, desired workerFormats) error {
-	for _, pair := range []struct {
-		previous map[string][]string
-		desired  map[string][]string
-	}{{previous.Wire, desired.Wire}, {previous.Migrations, desired.Migrations}} {
-		for category, entries := range pair.previous {
-			candidates, exists := pair.desired[category]
-			if !exists {
-				return errors.New("The release removes a recorded wire or migration category. Preserve every existing category and append new entries instead.")
-			}
-			allowed := make(map[string]bool, len(candidates))
-			for _, candidate := range candidates {
-				allowed[candidate] = true
-			}
-			for _, entry := range entries {
-				if !allowed[entry] {
-					return errors.New("The release removes or changes a recorded wire or migration entry. Preserve every exact existing entry and append new entries instead.")
-				}
+	for category, entries := range previous.Migrations {
+		candidates, exists := desired.Migrations[category]
+		if !exists {
+			return errors.New("The release removes an applied migration category. Preserve applied migration checksums and append new steps instead.")
+		}
+		allowed := make(map[string]bool, len(candidates))
+		for _, candidate := range candidates {
+			allowed[candidate] = true
+		}
+		for _, entry := range entries {
+			if !allowed[entry] {
+				return errors.New("The release removes or changes an applied migration. Preserve its exact checksum and append a new step instead.")
 			}
 		}
 	}

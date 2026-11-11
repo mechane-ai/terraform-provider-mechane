@@ -479,7 +479,11 @@ func TestWorkerReleasePreservesExistingNamespacesAndFormats(t *testing.T) {
 	state.Mutex.Unlock()
 	previous := fixture.Manifest.Formats
 	desired := workerFormats{Wire: map[string][]string{"sandbox": {"current-wire"}}, Migrations: previous.Migrations}
+	if err := preserveWorkerFormats(previous, desired); err != nil {
+		t.Fatalf("a retired API blocked an authorized cutover: %v", err)
+	}
+	desired.Migrations = map[string][]string{}
 	if err := preserveWorkerFormats(previous, desired); err == nil {
-		t.Fatal("a release removed a historical wire entry")
+		t.Fatal("a release removed an applied migration")
 	}
 }
