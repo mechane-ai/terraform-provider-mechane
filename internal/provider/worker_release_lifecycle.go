@@ -48,6 +48,10 @@ type workerDeployment struct {
 	Versions []workerTraffic `json:"versions"`
 }
 
+type workerCodeUpdateStrategy struct {
+	Mode string `json:"mode"`
+}
+
 type workerEnvelope[T any] struct {
 	Success    bool `json:"success"`
 	Result     T    `json:"result"`
@@ -260,9 +264,13 @@ func (r *workerReleaseResource) activateWorkerRelease(ctx context.Context, model
 		return workerDeployment{}, errors.New("The live Worker deployment changed after compatibility preflight. Refresh state and retry before uploading or activating a release.")
 	}
 	payload := struct {
-		Strategy string          `json:"strategy"`
-		Versions []workerTraffic `json:"versions"`
-	}{Strategy: "percentage", Versions: []workerTraffic{{VersionID: versionID, Percentage: 100}}}
+		Strategy           string                   `json:"strategy"`
+		Versions           []workerTraffic          `json:"versions"`
+		CodeUpdateStrategy workerCodeUpdateStrategy `json:"code_update_strategy"`
+	}{
+		Strategy: "percentage", Versions: []workerTraffic{{VersionID: versionID, Percentage: 100}},
+		CodeUpdateStrategy: workerCodeUpdateStrategy{Mode: "immediate"},
+	}
 	bytes, err := json.Marshal(payload)
 	if err != nil {
 		return workerDeployment{}, errors.New("The Worker activation could not be encoded.")

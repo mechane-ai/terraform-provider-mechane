@@ -102,23 +102,24 @@ func newWorkerReleaseFixture(t *testing.T) workerReleaseFixture {
 }
 
 type workerCloudflareFixture struct {
-	Mutex                  sync.Mutex
-	Requests               int
-	Writes                 int
-	Version                *workerVersion
-	Deployment             workerDeployment
-	Manifest               map[string]workerAssetEntry
-	Uploaded               map[string][]byte
-	MissingCompletion      bool
-	UnexpectedClass        bool
-	RebindSandboxNamespace bool
-	MechNamespaceExists    bool
-	FailVersionRead        bool
-	FailDeploymentRead     bool
-	LoseVersionResponse    bool
-	VersionUploads         int
-	DeploymentWrites       int
-	StaleActivationReads   int
+	Mutex                    sync.Mutex
+	Requests                 int
+	Writes                   int
+	Version                  *workerVersion
+	Deployment               workerDeployment
+	Manifest                 map[string]workerAssetEntry
+	Uploaded                 map[string][]byte
+	MissingCompletion        bool
+	UnexpectedClass          bool
+	RebindSandboxNamespace   bool
+	MechNamespaceExists      bool
+	FailVersionRead          bool
+	FailDeploymentRead       bool
+	LoseVersionResponse      bool
+	VersionUploads           int
+	DeploymentWrites         int
+	DeploymentCodeUpdateMode string
+	StaleActivationReads     int
 }
 
 func workerFixtureClient(t *testing.T, state *workerCloudflareFixture) *workerReleaseResource {
@@ -195,9 +196,17 @@ func workerFixtureClient(t *testing.T, state *workerCloudflareFixture) *workerRe
 			}
 		case strings.HasSuffix(path, "/deployments") && request.Method == http.MethodPost:
 			state.DeploymentWrites++
-			if err := json.NewDecoder(request.Body).Decode(&state.Deployment); err != nil {
+			var deployment struct {
+				workerDeployment
+				CodeUpdateStrategy struct {
+					Mode string `json:"mode"`
+				} `json:"code_update_strategy"`
+			}
+			if err := json.NewDecoder(request.Body).Decode(&deployment); err != nil {
 				t.Error(err)
 			}
+			state.Deployment = deployment.workerDeployment
+			state.DeploymentCodeUpdateMode = deployment.CodeUpdateStrategy.Mode
 			state.Deployment.ID = "deployment"
 			for index := range state.Version.Bindings {
 				if state.Version.Bindings[index].Type == "durable_object_namespace" && state.Version.Bindings[index].NamespaceID == "" {
@@ -287,37 +296,47 @@ func workerFixtureClient(t *testing.T, state *workerCloudflareFixture) *workerRe
 }
 
 func TestWorkerReleaseUploadsQualifiedModulesAndAssets(t *testing.T) {
-	fixture := newWorkerReleaseFixture(t)
-	state := &workerCloudflareFixture{}
-	resource := workerFixtureClient(t, state)
-	result, err := resource.applyRelease(context.Background(), fixture.Model)
-	if err != nil {
-		t.Fatal(err)
-	}
-	state.Mutex.Lock()
-	defer state.Mutex.Unlock()
-	if result.TrafficPercentage.ValueFloat64() != 100 || len(state.Version.Modules) != 2 || state.Version.Assets.Config.RunWorkerFirst != true {
-		t.Fatal("qualified application modules and assets were not exclusively activated")
-	}
-	entry, found := state.Manifest["/index.html"]
-	if !found || string(state.Uploaded[entry.Hash]) != "<!doctype html><title>Console</title>" {
-		t.Fatal("activated Console asset bytes differ from the qualified artifact")
-	}
-	hasAssets := false
-	for _, binding := range state.Version.Bindings {
-		if binding.Name == "ASSETS" && binding.Type == "assets" {
-			hasAssets = true
-		}
-	}
-	if !hasAssets {
-		t.Fatal("application has no ASSETS binding")
-	}
-	namespaces := result.DurableObjectNamespaces.Elements()
-	if len(namespaces) != 2 {
-		t.Fatal("application lost its Mech or Sandbox namespace")
-	}
-	if !namespaces["SandboxObject"].Equal(types.StringValue("existing-sandbox-namespace")) {
-		t.Fatal("application replaced the existing Sandbox namespace")
+	for _, scenario := range []struct {
+		name             string
+		hasMechNamespace bool
+	}{{"new mech namespace", false}, {"existing namespaces", true}} {
+		t.Run(scenario.name, func(t *testing.T) {
+			fixture := newWorkerReleaseFixture(t)
+			state := &workerCloudflareFixture{MechNamespaceExists: scenario.hasMechNamespace}
+			resource := workerFixtureClient(t, state)
+			result, err := resource.applyRelease(context.Background(), fixture.Model)
+			if err != nil {
+				t.Fatal(err)
+			}
+			state.Mutex.Lock()
+			defer state.Mutex.Unlock()
+			if result.TrafficPercentage.ValueFloat64() != 100 || len(state.Version.Modules) != 2 || state.Version.Assets.Config.RunWorkerFirst != true {
+				t.Fatal("qualified application modules and assets were not exclusively activated")
+			}
+			if scenario.hasMechNamespace && state.DeploymentCodeUpdateMode != "immediate" {
+				t.Fatal("a staged upgrade allowed active Durable Objects to retain the previous code")
+			}
+			entry, found := state.Manifest["/index.html"]
+			if !found || string(state.Uploaded[entry.Hash]) != "<!doctype html><title>Console</title>" {
+				t.Fatal("activated Console asset bytes differ from the qualified artifact")
+			}
+			hasAssets := false
+			for _, binding := range state.Version.Bindings {
+				if binding.Name == "ASSETS" && binding.Type == "assets" {
+					hasAssets = true
+				}
+			}
+			if !hasAssets {
+				t.Fatal("application has no ASSETS binding")
+			}
+			namespaces := result.DurableObjectNamespaces.Elements()
+			if len(namespaces) != 2 {
+				t.Fatal("application lost its Mech or Sandbox namespace")
+			}
+			if !namespaces["SandboxObject"].Equal(types.StringValue("existing-sandbox-namespace")) {
+				t.Fatal("application replaced the existing Sandbox namespace")
+			}
+		})
 	}
 }
 
