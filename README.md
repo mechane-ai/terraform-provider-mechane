@@ -7,7 +7,7 @@ official Cloudflare provider owns Worker identities, custom domains, and R2.
 Set `CLOUDFLARE_API_TOKEN` in the process environment. The token needs Workers and Containers access, plus Secrets Store
 Edit when binding account secrets. Credentials never become resource attributes.
 
-The provider supplies three building blocks:
+The installation uses these resources:
 
 - `mechane_cloudflare_worker_release` verifies qualification and all Worker modules and Console assets, uploads them,
   and exclusively activates a version with declared Durable Object exports and secret references. Removing it retains
@@ -15,9 +15,13 @@ The provider supplies three building blocks:
 - `mechane_cloudflare_container_image` verifies a local qualified OCI archive and copies its Linux amd64 image into the
   account registry. The release supplies the archive SHA-256 and image digest; `source_file` names the prepared archive.
   Installation needs no source checkout, publication prerequisite, or Docker daemon.
-- `mechane_cloudflare_container_application` binds a default-scheduled application to an existing Durable Object
-  namespace. It manages capacity and image rollouts, reads remote drift, and waits for active rollouts before continuing
-  an interrupted update.
+- `mechane_cloudflare_machine_application` binds Durable Object-scheduled compute to MachineObject. The Worker owns
+  image selection and native snapshots; the control-store ledger owns aggregate and workspace admission limits. The
+  provider verifies application name, namespace and scheduling policy before updates or deletion.
+
+`mechane_cloudflare_container_application` remains available to retire an existing default-scheduled application. It
+cannot adopt or delete a Durable Object-scheduled application. Complete its checkpoint and retirement procedure before
+switching compute ownership; retain the workspace namespace and bucket.
 
 Import a Worker release with `<account_id>/<worker_name>` or append `/<version_id>` to select a version. Import an
 existing application with `<account_id>/<application_id>`. Import an existing image with
@@ -62,10 +66,9 @@ Deleting an application stops its machines. It never deletes the Worker, Durable
 an image resource retains its registry bytes because running machines and earlier releases can still reference them.
 Registry garbage collection is a separate operator action.
 
-An apply waits for Cloudflare's deployment configuration to converge and rejects an explicit unhealthy target, even
-after its rollout ends. A sleeping application can have no running instances, and Cloudflare does not provide a health
-summary for every rollout strategy. Verify a cold sandbox through Mechane after installation to prove actual startup.
-Worker and guest releases must tolerate the mixed-version interval during a rollout.
+An apply verifies accepted application identities and settings. Durable Object-scheduled applications have no image
+rollout; image and configuration changes require retiring affected machines before activating their new owner. Verify a
+cold sandbox through Mechane after installation to prove actual startup and file restoration.
 
 The provider version is declared in [release.json](release.json) and advances independently of Mechane service releases.
 The installation module pins the provider version it requires.

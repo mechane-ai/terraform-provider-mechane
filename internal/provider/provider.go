@@ -80,7 +80,7 @@ func (p *mechaneProvider) Configure(ctx context.Context, request provider.Config
 }
 
 func (p *mechaneProvider) Resources(_ context.Context) []func() resource.Resource {
-	return []func() resource.Resource{newContainerApplicationResource, newContainerImageResource, newWorkerReleaseResource}
+	return []func() resource.Resource{newContainerApplicationResource, newMachineApplicationResource, newContainerImageResource, newWorkerReleaseResource}
 }
 
 func (p *mechaneProvider) DataSources(_ context.Context) []func() datasource.DataSource {
