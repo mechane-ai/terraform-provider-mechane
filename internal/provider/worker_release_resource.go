@@ -192,6 +192,10 @@ func (r *workerReleaseResource) Read(ctx context.Context, request resource.ReadR
 	ctx, cancel := context.WithTimeout(ctx, time.Minute)
 	defer cancel()
 	version, err := r.getWorkerVersion(ctx, state, state.VersionID.ValueString())
+	if workerVersionNotVisible(err) {
+		response.Diagnostics.AddError("Read Worker release", "Cloudflare has not confirmed the recorded Worker version. Its identity remains in state; refresh again when it is visible.")
+		return
+	}
 	if isNotFound(err) {
 		response.State.RemoveResource(ctx)
 		return

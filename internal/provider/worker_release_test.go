@@ -12,9 +12,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/cloudflare/cloudflare-go/v7"
 	"github.com/cloudflare/cloudflare-go/v7/option"
+	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 )
 
@@ -114,6 +117,9 @@ type workerCloudflareFixture struct {
 	RebindSandboxNamespace   bool
 	MechNamespaceExists      bool
 	FailVersionRead          bool
+	InvisibleVersionReads    int
+	InvisibleVersionCode     int64
+	VersionReads             int
 	FailDeploymentRead       bool
 	LoseVersionResponse      bool
 	VersionUploads           int
@@ -269,10 +275,21 @@ func workerFixtureClient(t *testing.T, state *workerCloudflareFixture) *workerRe
 			}
 			result = version
 		case strings.HasSuffix(path, "/versions/version"):
+			state.VersionReads++
 			if state.FailVersionRead {
 				response.Header().Set("CF-Ray", "0123456789abcdef-SJC")
 				response.WriteHeader(http.StatusForbidden)
 				_, _ = io.WriteString(response, `{"success":false,"errors":[{"code":10000,"message":"private-error-sentinel"}]}`)
+				return
+			}
+			if state.InvisibleVersionReads > 0 {
+				state.InvisibleVersionReads--
+				code := state.InvisibleVersionCode
+				if code == 0 {
+					code = 10071
+				}
+				response.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(response).Encode(map[string]any{"success": false, "errors": []map[string]any{{"code": code, "message": "private-error-sentinel"}}})
 				return
 			}
 			result = state.Version
@@ -381,7 +398,79 @@ func TestWorkerReleaseRetainsAcceptedActivationAfterReadFailure(t *testing.T) {
 			if result.DurableObjectNamespaces.IsUnknown() {
 				t.Fatal("accepted activation returned unknown namespace state")
 			}
+			if state.VersionReads != 1 || state.VersionUploads != 1 {
+				t.Fatal("an authorization error retried the version read or upload")
+			}
 		})
+	}
+}
+
+func TestWorkerReleaseWaitsForAcceptedVersionVisibility(t *testing.T) {
+	fixture := newWorkerReleaseFixture(t)
+	state := &workerCloudflareFixture{MechNamespaceExists: true, InvisibleVersionReads: 1}
+	result, err := workerFixtureClient(t, state).applyRelease(context.Background(), fixture.Model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.VersionID.ValueString() != "version" || result.TrafficPercentage.ValueFloat64() != 100 {
+		t.Fatal("the accepted version was not verified and activated")
+	}
+	if state.VersionUploads != 1 || state.VersionReads < 2 {
+		t.Fatal("the accepted version was not reconciled with reads alone")
+	}
+}
+
+func TestWorkerReleaseRetainsInvisibleAcceptedVersionAtDeadline(t *testing.T) {
+	fixture := newWorkerReleaseFixture(t)
+	state := &workerCloudflareFixture{MechNamespaceExists: true, InvisibleVersionReads: 100}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := workerFixtureClient(t, state).applyRelease(ctx, fixture.Model)
+	if err == nil || result.VersionID.ValueString() != "version" {
+		t.Fatal("the accepted version identity was not retained after visibility timed out")
+	}
+	if state.VersionUploads != 1 || state.VersionReads < 2 || state.DeploymentWrites != 0 {
+		t.Fatal("visibility timeout repeated the upload, skipped reconciliation, or activated the version")
+	}
+}
+
+func TestWorkerReleaseRefreshRetainsInvisibleVersion(t *testing.T) {
+	fixture := newWorkerReleaseFixture(t)
+	fixture.Model.ID = types.StringValue("account/retained-worker")
+	fixture.Model.VersionID = types.StringValue("version")
+	fixture.Model.CompatibilityFlags = types.SetNull(types.StringType)
+	fixture.Model.ContainerClasses = types.SetNull(types.StringType)
+	fixture.Model.DurableObjectBindings = types.SetNull(workerBindingObjectType())
+	fixture.Model.Exports = types.MapNull(workerExportObjectType())
+	fixture.Model.DurableObjectNamespaces = types.MapNull(types.StringType)
+	state := &workerCloudflareFixture{InvisibleVersionReads: 1}
+	r := workerFixtureClient(t, state)
+	var schemaResponse resource.SchemaResponse
+	r.Schema(context.Background(), resource.SchemaRequest{}, &schemaResponse)
+	stored := tfsdk.State{Schema: schemaResponse.Schema}
+	if diagnostics := stored.Set(context.Background(), &fixture.Model); diagnostics.HasError() {
+		t.Fatal(diagnostics)
+	}
+	response := resource.ReadResponse{State: stored}
+	r.Read(context.Background(), resource.ReadRequest{State: stored}, &response)
+	if !response.Diagnostics.HasError() || response.State.Raw.IsNull() {
+		t.Fatal("an invisible recorded version must report an error and retain its state")
+	}
+	var retained workerReleaseModel
+	if diagnostics := response.State.Get(context.Background(), &retained); diagnostics.HasError() {
+		t.Fatal(diagnostics)
+	}
+	if retained.VersionID.ValueString() != "version" || state.VersionReads != 1 || state.VersionUploads != 0 {
+		t.Fatal("refresh lost the recorded version or repeated its upload")
+	}
+}
+
+func TestWorkerReleaseDoesNotRetryUnrelatedVersionNotFound(t *testing.T) {
+	fixture := newWorkerReleaseFixture(t)
+	state := &workerCloudflareFixture{MechNamespaceExists: true, InvisibleVersionReads: 100, InvisibleVersionCode: 10070}
+	result, err := workerFixtureClient(t, state).applyRelease(context.Background(), fixture.Model)
+	if err == nil || result.VersionID.ValueString() != "version" || state.VersionReads != 1 || state.VersionUploads != 1 {
+		t.Fatal("an unrelated not-found error was retried or the accepted identity was lost")
 	}
 }
 

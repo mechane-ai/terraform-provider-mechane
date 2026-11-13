@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
 	"time"
 
@@ -74,10 +75,38 @@ func (r *workerReleaseResource) getWorkerVersion(ctx context.Context, model work
 	if err != nil {
 		return workerVersion{}, err
 	}
-	if !envelope.Success || envelope.Result.ID == "" {
+	if !envelope.Success || id == "" || envelope.Result.ID != id {
 		return workerVersion{}, errors.New("Cloudflare did not return the requested Worker version.")
 	}
 	return envelope.Result, nil
+}
+
+func workerVersionNotVisible(err error) bool {
+	var apiError *cloudflare.Error
+	return errors.As(err, &apiError) && apiError.StatusCode == http.StatusNotFound &&
+		len(apiError.Errors) == 1 && apiError.Errors[0].Code == 10071
+}
+
+func (r *workerReleaseResource) waitForUploadedWorkerVersion(ctx context.Context, model workerReleaseModel, id string) (workerVersion, error) {
+	visibility, cancel := context.WithTimeout(ctx, 90*time.Second)
+	defer cancel()
+	for {
+		version, err := r.getWorkerVersion(visibility, model, id)
+		if err == nil {
+			return version, nil
+		}
+		if visibility.Err() != nil {
+			return workerVersion{}, fmt.Errorf("Cloudflare accepted Worker version %s, but its visibility could not be confirmed before the deadline. The upload was not repeated; refresh state to reconcile it.", id)
+		}
+		if !workerVersionNotVisible(err) {
+			return workerVersion{}, errors.New(describeCloudflareError(err))
+		}
+		select {
+		case <-visibility.Done():
+			return workerVersion{}, fmt.Errorf("Cloudflare accepted Worker version %s, but its visibility could not be confirmed before the deadline. The upload was not repeated; refresh state to reconcile it.", id)
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 func (r *workerReleaseResource) getWorkerDeployment(ctx context.Context, model workerReleaseModel) (workerDeployment, error) {
@@ -226,9 +255,9 @@ func (r *workerReleaseResource) uploadWorkerRelease(ctx context.Context, model w
 	// Cloudflare cannot bind a new class until its export is reconciled by deployment.
 	err = r.client.Post(ctx, workerVersionPath(model), nil, &envelope, option.WithQuery("deploy", fmt.Sprint(deploy)), option.WithRequestBody("application/json", bytes))
 	if err == nil && envelope.Success && envelope.Result.ID != "" {
-		version, readErr := r.getWorkerVersion(ctx, model, envelope.Result.ID)
+		version, readErr := r.waitForUploadedWorkerVersion(ctx, model, envelope.Result.ID)
 		if readErr != nil {
-			return envelope.Result, errors.New(describeCloudflareError(readErr))
+			return envelope.Result, readErr
 		}
 		return version, nil
 	}
