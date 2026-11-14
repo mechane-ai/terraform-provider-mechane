@@ -65,7 +65,7 @@ func readRegistryImage(config imageModel, options []remote.Option) (bool, error)
 	return true, nil
 }
 
-func (r *containerImageResource) copyImage(ctx context.Context, config imageModel) error {
+func (r *containerImageResource) installImage(ctx context.Context, config imageModel) error {
 	archive, cleanup, err := stageImageArchive(ctx, config)
 	if err != nil {
 		return err
@@ -80,25 +80,27 @@ func (r *containerImageResource) copyImage(ctx context.Context, config imageMode
 		return err
 	}
 	found, err := readRegistryImage(config, options)
-	if err != nil || found {
-		return err
-	}
-	tagName := "registry.cloudflare.com/" + config.AccountID.ValueString() + "/" + config.Repository.ValueString() + ":sha256-" + strings.TrimPrefix(config.Digest.ValueString(), "sha256:")
-	tag, err := name.NewTag(tagName, name.StrictValidation)
-	if err != nil {
-		return errors.New("The destination registry repository is invalid.")
-	}
-	if err := remote.Write(tag, image, options...); err != nil {
-		return describeRegistryError(err)
-	}
-	found, err = readRegistryImage(config, options)
 	if err != nil {
 		return err
 	}
 	if !found {
-		return errors.New("The registry did not return the uploaded image digest. Retry to resume the content-addressed upload.")
+		tagName := "registry.cloudflare.com/" + config.AccountID.ValueString() + "/" + config.Repository.ValueString() + ":sha256-" + strings.TrimPrefix(config.Digest.ValueString(), "sha256:")
+		tag, err := name.NewTag(tagName, name.StrictValidation)
+		if err != nil {
+			return errors.New("The destination registry repository is invalid.")
+		}
+		if err := remote.Write(tag, image, options...); err != nil {
+			return describeRegistryError(err)
+		}
+		found, err = readRegistryImage(config, options)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return errors.New("The registry did not return the uploaded image digest. Retry to resume the content-addressed upload.")
+		}
 	}
-	return nil
+	return r.prepareImage(ctx, config)
 }
 
 func imageReference(config imageModel) string {

@@ -44,7 +44,7 @@ func (r *containerImageResource) Schema(_ context.Context, _ resource.SchemaRequ
 	immutable := []planmodifier.String{stringplanmodifier.RequiresReplace()}
 	response.Schema = schema.Schema{
 		Version:     1,
-		Description: "Copies a verified OCI release archive into the account's Cloudflare registry without Docker. Removal forgets ownership and retains the immutable image for running applications and rollback.",
+		Description: "Copies a verified OCI release archive into the account's Cloudflare registry and waits for runtime image preparation without Docker. Removal forgets ownership and retains the immutable image for running applications and rollback.",
 		Attributes: map[string]schema.Attribute{
 			"account_id":                schema.StringAttribute{Required: true, PlanModifiers: immutable},
 			"repository":                schema.StringAttribute{Required: true, PlanModifiers: immutable},
@@ -106,8 +106,8 @@ func (r *containerImageResource) Create(ctx context.Context, request resource.Cr
 	}
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(plan.OperationTimeoutSeconds.ValueInt64())*time.Second)
 	defer cancel()
-	if err := r.copyImage(ctx, plan); err != nil {
-		response.Diagnostics.AddError("Copy container image", err.Error())
+	if err := r.installImage(ctx, plan); err != nil {
+		response.Diagnostics.AddError("Install container image", err.Error())
 		return
 	}
 	plan.ID = types.StringValue(plan.AccountID.ValueString() + "/" + plan.Repository.ValueString() + "@" + plan.Digest.ValueString())
@@ -139,10 +139,17 @@ func (r *containerImageResource) Read(ctx context.Context, request resource.Read
 func (r *containerImageResource) Update(ctx context.Context, request resource.UpdateRequest, response *resource.UpdateResponse) {
 	var plan imageModel
 	response.Diagnostics.Append(request.Plan.Get(ctx, &plan)...)
-	if !response.Diagnostics.HasError() {
-		plan.Image = types.StringValue("registry.cloudflare.com/" + plan.ID.ValueString())
-		response.Diagnostics.Append(response.State.Set(ctx, &plan)...)
+	if response.Diagnostics.HasError() {
+		return
 	}
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(plan.OperationTimeoutSeconds.ValueInt64())*time.Second)
+	defer cancel()
+	if err := r.installImage(ctx, plan); err != nil {
+		response.Diagnostics.AddError("Install container image", err.Error())
+		return
+	}
+	plan.Image = types.StringValue("registry.cloudflare.com/" + plan.ID.ValueString())
+	response.Diagnostics.Append(response.State.Set(ctx, &plan)...)
 }
 
 func (r *containerImageResource) Delete(context.Context, resource.DeleteRequest, *resource.DeleteResponse) {

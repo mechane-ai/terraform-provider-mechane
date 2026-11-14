@@ -12,9 +12,10 @@ The installation uses these resources:
 - `mechane_cloudflare_worker_release` verifies qualification and all Worker modules and Console assets, uploads them,
   and exclusively activates a version with declared Durable Object exports and secret references. Removing it retains
   the Worker and data.
-- `mechane_cloudflare_container_image` verifies a local qualified OCI archive and copies its Linux amd64 image into the
-  account registry. The release supplies the archive SHA-256 and image digest; `source_file` names the prepared archive.
-  Installation needs no source checkout, publication prerequisite, or Docker daemon.
+- `mechane_cloudflare_container_image` verifies a local qualified OCI archive, copies its Linux amd64 image into the
+  account registry, and waits for Cloudflare runtime image preparation. The release supplies the archive SHA-256 and
+  image digest; `source_file` names the prepared archive. Installation needs no source checkout, publication
+  prerequisite, or Docker daemon.
 - `mechane_cloudflare_machine_application` binds Durable Object-scheduled compute to MachineObject. The Worker owns
   image selection and native snapshots; the control-store ledger owns aggregate and workspace admission limits. The
   provider verifies application name, namespace and scheduling policy before updates or deletion.
@@ -67,6 +68,16 @@ atomic deployment's identity guard. Verify actual actor behavior after deploymen
 Deleting an application stops its machines. It never deletes the Worker, Durable Object namespace, or R2 files. Removing
 an image resource retains its registry bytes because running machines and earlier releases can still reference them.
 Registry garbage collection is a separate operator action.
+
+Image create and update both require a matching `ready` result from Cloudflare's
+[image preparation API](https://developers.cloudflare.com/api/resources/containers/subresources/images/methods/prepare/),
+including when the registry already contains the manifest. Pending preparation shares the operation deadline; terminal
+errors, mismatched images and incomplete ready responses fail the apply. The prepared artifact digest is separate from
+the OCI image digest.
+
+Image refresh only verifies registry content and starts no preparation. A no-change plan does not establish runtime
+readiness for images installed by an older provider or imported from existing state. An explicitly reviewed image
+resource replacement resumes installation and preparation while retaining the immutable registry bytes.
 
 An apply verifies accepted application identities and settings. Durable Object-scheduled applications have no image
 rollout; image and configuration changes require retiring affected machines before activating their new owner. Verify a
