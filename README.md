@@ -55,12 +55,14 @@ and sizes, and never use credentials. Unmarked Workers are not adopted. A new in
 identity. The provider checks deployment identity again before a write and stops if it observes a concurrent change.
 Cloudflare does not offer atomic compare-and-swap for deployment, so use one deployment writer per installation.
 
-Staged upgrades to existing Durable Object namespaces request
+Every intentional release create or update requests
 [`code_update_strategy: { "mode": "immediate" }`](https://developers.cloudflare.com/durable-objects/deployments/durable-objects-code-updates/)
 with exclusive version activation. Active objects reset onto the new code, including every exported Durable Object
-class. The setting belongs to each deployment and is write-only; deployment readback confirms the active version. Atomic
-creation of a new bound namespace uses `versions?deploy=true`, which has no documented adoption-strategy field. That
-path retains Cloudflare's default deferral for existing active objects; verify actual actor behavior after deployment.
+class, even when the selected version is already active. The setting belongs to each deployment and is write-only; the
+provider requires a successful write acknowledgement and confirms its deployment identity and exclusive version. Traffic
+readback cannot establish the adoption policy after a rejected or lost response. Atomic creation of a new bound
+namespace uses `versions?deploy=true`, followed by an immediate deployment in the same operation under the observed
+atomic deployment's identity guard. Verify actual actor behavior after deployment.
 
 Deleting an application stops its machines. It never deletes the Worker, Durable Object namespace, or R2 files. Removing
 an image resource retains its registry bytes because running machines and earlier releases can still reference them.

@@ -125,6 +125,9 @@ type workerCloudflareFixture struct {
 	VersionUploads           int
 	DeploymentWrites         int
 	DeploymentCodeUpdateMode string
+	RejectActivation         bool
+	LoseActivationResponse   bool
+	ActivationReadID         string
 	StaleActivationReads     int
 }
 
@@ -211,8 +214,13 @@ func workerFixtureClient(t *testing.T, state *workerCloudflareFixture) *workerRe
 			if err := json.NewDecoder(request.Body).Decode(&deployment); err != nil {
 				t.Error(err)
 			}
-			state.Deployment = deployment.workerDeployment
 			state.DeploymentCodeUpdateMode = deployment.CodeUpdateStrategy.Mode
+			if state.RejectActivation {
+				response.WriteHeader(http.StatusForbidden)
+				_, _ = io.WriteString(response, `{"success":false,"errors":[{"code":10000,"message":"private-error-sentinel"}]}`)
+				return
+			}
+			state.Deployment = deployment.workerDeployment
 			state.Deployment.ID = "deployment"
 			for index := range state.Version.Bindings {
 				if state.Version.Bindings[index].Type == "durable_object_namespace" && state.Version.Bindings[index].NamespaceID == "" {
@@ -220,6 +228,11 @@ func workerFixtureClient(t *testing.T, state *workerCloudflareFixture) *workerRe
 				}
 			}
 			state.MechNamespaceExists = true
+			if state.LoseActivationResponse {
+				response.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(response, `{"success":false,"errors":[{"code":10000,"message":"Response lost after acceptance"}]}`)
+				return
+			}
 			result = state.Deployment
 		case strings.HasSuffix(path, "/deployments"):
 			if state.Version != nil && state.FailDeploymentRead {
@@ -231,7 +244,11 @@ func workerFixtureClient(t *testing.T, state *workerCloudflareFixture) *workerRe
 			if state.Version != nil && state.StaleActivationReads > 0 {
 				state.StaleActivationReads--
 			} else if state.Deployment.ID != "" {
-				deployments = append(deployments, state.Deployment)
+				deployment := state.Deployment
+				if state.DeploymentWrites > 0 && state.ActivationReadID != "" {
+					deployment.ID = state.ActivationReadID
+				}
+				deployments = append(deployments, deployment)
 			}
 			result = map[string]any{"deployments": deployments}
 		case strings.HasSuffix(path, "/versions") && request.Method == http.MethodPost:
@@ -265,7 +282,7 @@ func workerFixtureClient(t *testing.T, state *workerCloudflareFixture) *workerRe
 			}
 			state.Version = &version
 			if deploy {
-				state.Deployment = workerDeployment{ID: "deployment", Versions: []workerTraffic{{VersionID: version.ID, Percentage: 100}}}
+				state.Deployment = workerDeployment{ID: "atomic-deployment", Versions: []workerTraffic{{VersionID: version.ID, Percentage: 100}}}
 				state.MechNamespaceExists = true
 			}
 			if state.LoseVersionResponse {
@@ -330,8 +347,8 @@ func TestWorkerReleaseUploadsQualifiedModulesAndAssets(t *testing.T) {
 			if result.TrafficPercentage.ValueFloat64() != 100 || len(state.Version.Modules) != 2 || state.Version.Assets.Config.RunWorkerFirst != true {
 				t.Fatal("qualified application modules and assets were not exclusively activated")
 			}
-			if scenario.hasMechNamespace && state.DeploymentCodeUpdateMode != "immediate" {
-				t.Fatal("a staged upgrade allowed active Durable Objects to retain the previous code")
+			if state.DeploymentCodeUpdateMode != "immediate" {
+				t.Fatal("activation allowed active Durable Objects to retain the previous code")
 			}
 			entry, found := state.Manifest["/index.html"]
 			if !found || string(state.Uploaded[entry.Hash]) != "<!doctype html><title>Console</title>" {
@@ -354,6 +371,65 @@ func TestWorkerReleaseUploadsQualifiedModulesAndAssets(t *testing.T) {
 				t.Fatal("application replaced the existing Sandbox namespace")
 			}
 		})
+	}
+}
+
+func TestWorkerReleaseRequestsImmediateAdoptionForActiveVersion(t *testing.T) {
+	fixture := newWorkerReleaseFixture(t)
+	state := &workerCloudflareFixture{
+		Version:    &workerVersion{},
+		Deployment: workerDeployment{ID: "active-deployment", Versions: []workerTraffic{{VersionID: "version", Percentage: 100}}},
+	}
+	result, err := workerFixtureClient(t, state).activateWorkerRelease(context.Background(), fixture.Model, "version", "active-deployment")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.DeploymentCodeUpdateMode != "immediate" || result.ID != "deployment" {
+		t.Fatal("an already-active version did not receive an acknowledged immediate activation")
+	}
+}
+
+func TestWorkerReleaseDoesNotInferAdoptionFromTrafficAfterFailedWrite(t *testing.T) {
+	for _, scenario := range []struct {
+		name   string
+		reject bool
+	}{{"rejected activation", true}, {"lost activation response", false}} {
+		t.Run(scenario.name, func(t *testing.T) {
+			fixture := newWorkerReleaseFixture(t)
+			state := &workerCloudflareFixture{
+				Version:                &workerVersion{},
+				Deployment:             workerDeployment{ID: "active-deployment", Versions: []workerTraffic{{VersionID: "version", Percentage: 100}}},
+				RejectActivation:       scenario.reject,
+				LoseActivationResponse: !scenario.reject,
+			}
+			result, err := workerFixtureClient(t, state).activateWorkerRelease(context.Background(), fixture.Model, "version", "active-deployment")
+			if err == nil {
+				t.Fatal("exclusive traffic was treated as proof of an unacknowledged adoption policy")
+			}
+			if result.ID == "" || len(result.Versions) != 1 || result.Versions[0].Percentage != 100 {
+				t.Fatal("failed activation lost its observed deployment")
+			}
+			if state.DeploymentWrites != 1 || state.DeploymentCodeUpdateMode != "immediate" {
+				t.Fatal("an unacknowledged immediate activation was skipped or repeated")
+			}
+		})
+	}
+}
+
+func TestWorkerReleaseRequiresItsAcknowledgedDeployment(t *testing.T) {
+	fixture := newWorkerReleaseFixture(t)
+	state := &workerCloudflareFixture{
+		Version:          &workerVersion{},
+		ActivationReadID: "concurrent-deployment",
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result, err := workerFixtureClient(t, state).activateWorkerRelease(ctx, fixture.Model, "version", "")
+	if err == nil || result.ID != "concurrent-deployment" {
+		t.Fatal("another deployment of the same version was treated as the acknowledged activation")
+	}
+	if state.DeploymentWrites != 1 {
+		t.Fatal("deployment confirmation repeated the activation write")
 	}
 }
 
@@ -389,7 +465,7 @@ func TestWorkerReleaseRetainsAcceptedActivationAfterReadFailure(t *testing.T) {
 				if !result.DeploymentID.IsNull() || !result.TrafficPercentage.IsNull() {
 					t.Fatal("an unobserved deployment was recorded as absent or active")
 				}
-			} else if result.DeploymentID.ValueString() != "deployment" || result.TrafficPercentage.ValueFloat64() != 100 {
+			} else if result.DeploymentID.ValueString() != "atomic-deployment" || result.TrafficPercentage.ValueFloat64() != 100 {
 				t.Fatal("observed activation was lost when its version read failed")
 			}
 			if strings.Contains(err.Error(), "private-error-sentinel") {
@@ -487,8 +563,8 @@ func TestWorkerReleaseReconcilesUncertainActivationWithoutRepeatingUpload(t *tes
 	}
 	state.Mutex.Lock()
 	defer state.Mutex.Unlock()
-	if state.VersionUploads != 1 || state.DeploymentWrites != 0 {
-		t.Fatal("an uncertain atomic activation repeated its upload or deployment")
+	if state.VersionUploads != 1 || state.DeploymentWrites != 1 || state.DeploymentCodeUpdateMode != "immediate" {
+		t.Fatal("an uncertain atomic activation repeated its upload or missed immediate adoption")
 	}
 }
 

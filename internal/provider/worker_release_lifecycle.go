@@ -286,9 +286,6 @@ func (r *workerReleaseResource) activateWorkerRelease(ctx context.Context, model
 	if err != nil {
 		return workerDeployment{}, errors.New(describeCloudflareError(err))
 	}
-	if len(current.Versions) == 1 && current.Versions[0].VersionID == versionID && current.Versions[0].Percentage == 100 {
-		return current, nil
-	}
 	if current.ID != expectedDeploymentID {
 		return workerDeployment{}, errors.New("The live Worker deployment changed after compatibility preflight. Refresh state and retry before uploading or activating a release.")
 	}
@@ -306,24 +303,37 @@ func (r *workerReleaseResource) activateWorkerRelease(ctx context.Context, model
 	}
 	var envelope workerEnvelope[workerDeployment]
 	postError := r.client.Post(ctx, workerDeploymentPath(model), nil, &envelope, option.WithRequestBody("application/json", bytes))
-	return r.confirmWorkerActivation(ctx, model, versionID, postError)
+	if postError != nil || !envelope.Success || envelope.Result.ID == "" {
+		observed, _ := r.getWorkerDeployment(ctx, model)
+		message := "The immediate Worker activation was not acknowledged. Traffic readback cannot confirm the write-only code adoption policy."
+		if postError != nil {
+			message += " " + describeCloudflareError(postError)
+		}
+		return observed, errors.New(message)
+	}
+	deployment, err := r.confirmWorkerActivation(ctx, model, versionID, envelope.Result.ID)
+	if deployment.ID == "" {
+		deployment = envelope.Result
+	}
+	return deployment, err
 }
 
-func (r *workerReleaseResource) confirmWorkerActivation(ctx context.Context, model workerReleaseModel, versionID string, postError error) (workerDeployment, error) {
+func (r *workerReleaseResource) confirmWorkerActivation(ctx context.Context, model workerReleaseModel, versionID string, deploymentID string) (workerDeployment, error) {
 	// Activation can be accepted before the read endpoint reflects it. Reconcile reads, never repeat the POST.
 	confirmation, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	var observed workerDeployment
 	for {
 		current, err := r.getWorkerDeployment(confirmation, model)
-		if err == nil && len(current.Versions) == 1 && current.Versions[0].VersionID == versionID && current.Versions[0].Percentage == 100 {
+		if err == nil && current.ID != "" {
+			observed = current
+		}
+		if err == nil && current.ID != "" && (deploymentID == "" || current.ID == deploymentID) && len(current.Versions) == 1 && current.Versions[0].VersionID == versionID && current.Versions[0].Percentage == 100 {
 			return current, nil
 		}
 		select {
 		case <-confirmation.Done():
-			if postError != nil {
-				return workerDeployment{}, errors.New(describeCloudflareError(postError))
-			}
-			return workerDeployment{}, errors.New("The requested Worker version is not exclusively active. Refresh state and retry; the existing version will be reused.")
+			return observed, errors.New("The requested Worker deployment and exclusive version could not be confirmed. Refresh state and retry; the existing version will be reused.")
 		case <-time.After(2 * time.Second):
 		}
 	}
@@ -405,16 +415,20 @@ func (r *workerReleaseResource) applyRelease(ctx context.Context, plan workerRel
 	if err := verifyWorkerNamespaceIdentities(version, preserved); err != nil {
 		return plan, err
 	}
-	var deployment workerDeployment
 	if deployOnUpload {
-		deployment, err = r.confirmWorkerActivation(ctx, plan, version.ID, nil)
-	} else {
-		deployment, err = r.activateWorkerRelease(ctx, plan, version.ID, expectedDeploymentID)
+		observed, readErr := r.confirmWorkerActivation(ctx, plan, version.ID, "")
+		if readErr != nil {
+			return plan, readErr
+		}
+		expectedDeploymentID = observed.ID
+	}
+	deployment, err := r.activateWorkerRelease(ctx, plan, version.ID, expectedDeploymentID)
+	if deployment.ID != "" {
+		plan.readWorkerDeployment(deployment)
 	}
 	if err != nil {
 		return plan, err
 	}
-	plan.readWorkerDeployment(deployment)
 	version, err = r.getWorkerVersion(ctx, plan, version.ID)
 	if err != nil {
 		return plan, errors.New(describeCloudflareError(err))
