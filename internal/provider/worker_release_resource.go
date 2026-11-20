@@ -57,7 +57,7 @@ func (r *workerReleaseResource) Metadata(_ context.Context, request resource.Met
 func (r *workerReleaseResource) Schema(_ context.Context, _ resource.SchemaRequest, response *resource.SchemaResponse) {
 	immutable := []planmodifier.String{stringplanmodifier.RequiresReplace()}
 	response.Schema = schema.Schema{
-		Version:     1,
+		Version:     2,
 		Description: "An immutable Worker bundle, its reference-only bindings, and exclusive activation. The separate Worker resource owns identity and deletion; removing this release retains versions, Durable Objects, and their data.",
 		Attributes: map[string]schema.Attribute{
 			"account_id":              schema.StringAttribute{Required: true, PlanModifiers: immutable},
@@ -95,6 +95,7 @@ func workerBindingAttributes() map[string]schema.Attribute {
 	return map[string]schema.Attribute{
 		"name":         schema.StringAttribute{Required: true},
 		"type":         schema.StringAttribute{Required: true},
+		"id":           schema.StringAttribute{Optional: true},
 		"text":         schema.StringAttribute{Optional: true},
 		"class_name":   schema.StringAttribute{Optional: true},
 		"bucket_name":  schema.StringAttribute{Optional: true},
@@ -145,7 +146,7 @@ func (r *workerReleaseResource) ValidateConfig(ctx context.Context, request reso
 				continue
 			}
 			switch binding.Type.ValueString() {
-			case "plain_text", "r2_bucket", "secrets_store_secret":
+			case "plain_text", "r2_bucket", "secrets_store_secret", "hyperdrive":
 			default:
 				response.Diagnostics.AddAttributeError(path.Root("bindings"), "Unsupported Worker binding", "Use supported resource bindings or Secrets Store references. Credential values and secret_text bindings are not accepted.")
 			}

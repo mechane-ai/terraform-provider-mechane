@@ -69,18 +69,33 @@ func TestReleaseStateUpgradeRetainsRemoteIdentities(t *testing.T) {
 				t.Fatal(err)
 			}
 			for name, value := range previous {
-				if name != "source_url" {
-					expected, err := json.Marshal(value)
+				if name == "source_url" {
+					continue
+				}
+				if kind == "worker" && name == "durable_object_bindings" {
+					expected, err := json.Marshal([]map[string]any{{"name": "SANDBOXES", "type": "durable_object_namespace", "id": nil, "class_name": "SandboxObject", "text": nil, "bucket_name": nil, "jurisdiction": nil, "store_id": nil, "secret_name": nil}})
 					if err != nil {
 						t.Fatal(err)
 					}
-					previousValue, err := tftypes.ValueFromJSON(expected, currentType.AttributeTypes[name])
+					expectedValue, err := tftypes.ValueFromJSON(expected, currentType.AttributeTypes[name])
 					if err != nil {
 						t.Fatal(err)
 					}
-					if !values[name].Equal(previousValue) {
+					if !values[name].Equal(expectedValue) {
 						t.Fatalf("upgrade changed %s", name)
 					}
+					continue
+				}
+				expected, err := json.Marshal(value)
+				if err != nil {
+					t.Fatal(err)
+				}
+				previousValue, err := tftypes.ValueFromJSON(expected, currentType.AttributeTypes[name])
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !values[name].Equal(previousValue) {
+					t.Fatalf("upgrade changed %s", name)
 				}
 			}
 			if kind == "worker" && !values["qualification_sha256"].IsNull() {

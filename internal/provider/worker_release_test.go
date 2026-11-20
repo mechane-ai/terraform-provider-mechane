@@ -105,30 +105,31 @@ func newWorkerReleaseFixture(t *testing.T) workerReleaseFixture {
 }
 
 type workerCloudflareFixture struct {
-	Mutex                    sync.Mutex
-	Requests                 int
-	Writes                   int
-	Version                  *workerVersion
-	Deployment               workerDeployment
-	Manifest                 map[string]workerAssetEntry
-	Uploaded                 map[string][]byte
-	MissingCompletion        bool
-	UnexpectedClass          bool
-	RebindSandboxNamespace   bool
-	MechNamespaceExists      bool
-	FailVersionRead          bool
-	InvisibleVersionReads    int
-	InvisibleVersionCode     int64
-	VersionReads             int
-	FailDeploymentRead       bool
-	LoseVersionResponse      bool
-	VersionUploads           int
-	DeploymentWrites         int
-	DeploymentCodeUpdateMode string
-	RejectActivation         bool
-	LoseActivationResponse   bool
-	ActivationReadID         string
-	StaleActivationReads     int
+	Mutex                        sync.Mutex
+	Requests                     int
+	Writes                       int
+	Version                      *workerVersion
+	Deployment                   workerDeployment
+	Manifest                     map[string]workerAssetEntry
+	Uploaded                     map[string][]byte
+	MissingCompletion            bool
+	UnexpectedClass              bool
+	RebindSandboxNamespace       bool
+	MechNamespaceExists          bool
+	FailVersionRead              bool
+	InvisibleVersionReads        int
+	PostActivationInvisibleReads int
+	InvisibleVersionCode         int64
+	VersionReads                 int
+	FailDeploymentRead           bool
+	LoseVersionResponse          bool
+	VersionUploads               int
+	DeploymentWrites             int
+	DeploymentCodeUpdateMode     string
+	RejectActivation             bool
+	LoseActivationResponse       bool
+	ActivationReadID             string
+	StaleActivationReads         int
 }
 
 func workerFixtureClient(t *testing.T, state *workerCloudflareFixture) *workerReleaseResource {
@@ -307,6 +308,12 @@ func workerFixtureClient(t *testing.T, state *workerCloudflareFixture) *workerRe
 				}
 				response.WriteHeader(http.StatusNotFound)
 				_ = json.NewEncoder(response).Encode(map[string]any{"success": false, "errors": []map[string]any{{"code": code, "message": "private-error-sentinel"}}})
+				return
+			}
+			if state.DeploymentWrites > 0 && state.PostActivationInvisibleReads > 0 {
+				state.PostActivationInvisibleReads--
+				response.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(response).Encode(map[string]any{"success": false, "errors": []map[string]any{{"code": 10071, "message": "private-error-sentinel"}}})
 				return
 			}
 			result = state.Version
@@ -496,6 +503,21 @@ func TestWorkerReleaseWaitsForAcceptedVersionVisibility(t *testing.T) {
 	}
 }
 
+func TestWorkerReleaseWaitsForPostActivationVersionVisibility(t *testing.T) {
+	fixture := newWorkerReleaseFixture(t)
+	state := &workerCloudflareFixture{MechNamespaceExists: true, PostActivationInvisibleReads: 1}
+	result, err := workerFixtureClient(t, state).applyRelease(context.Background(), fixture.Model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.VersionID.ValueString() != "version" || result.TrafficPercentage.ValueFloat64() != 100 {
+		t.Fatal("the activated version was not verified after eventual-consistency read lag")
+	}
+	if state.VersionUploads != 1 || state.DeploymentWrites != 1 || state.VersionReads < 3 {
+		t.Fatal("post-activation version visibility did not retry reads without repeating writes")
+	}
+}
+
 func TestWorkerReleaseRetainsInvisibleAcceptedVersionAtDeadline(t *testing.T) {
 	fixture := newWorkerReleaseFixture(t)
 	state := &workerCloudflareFixture{MechNamespaceExists: true, InvisibleVersionReads: 100}
@@ -646,6 +668,40 @@ func TestWorkerReleaseRejectsEvidenceForDifferentInputs(t *testing.T) {
 	defer state.Mutex.Unlock()
 	if state.Requests != 0 {
 		t.Fatal("stale evidence reached the Cloudflare API")
+	}
+}
+
+func TestWorkerReleaseSupportsHyperdriveBinding(t *testing.T) {
+	fixture := newWorkerReleaseFixture(t)
+	bindings, diagnostics := types.SetValueFrom(context.Background(), workerBindingObjectType(), []workerBindingModel{
+		{
+			Name: types.StringValue("HYPERDRIVE"),
+			Type: types.StringValue("hyperdrive"),
+			ID:   types.StringValue("hyperdrive-config-id"),
+		},
+	})
+	if diagnostics.HasError() {
+		t.Fatal(diagnostics)
+	}
+	fixture.Model.Bindings = bindings
+	state := &workerCloudflareFixture{MechNamespaceExists: true}
+	result, err := workerFixtureClient(t, state).applyRelease(context.Background(), fixture.Model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.TrafficPercentage.ValueFloat64() != 100 {
+		t.Fatal("release with Hyperdrive binding was not activated")
+	}
+	state.Mutex.Lock()
+	defer state.Mutex.Unlock()
+	foundHyperdrive := false
+	for _, binding := range state.Version.Bindings {
+		if binding.Name == "HYPERDRIVE" && binding.Type == "hyperdrive" && binding.ID != nil && *binding.ID == "hyperdrive-config-id" {
+			foundHyperdrive = true
+		}
+	}
+	if !foundHyperdrive {
+		t.Fatal("uploaded Worker version did not include the HYPERDRIVE binding")
 	}
 }
 

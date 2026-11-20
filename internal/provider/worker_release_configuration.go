@@ -18,6 +18,7 @@ import (
 type workerBindingModel struct {
 	Name         types.String `tfsdk:"name"`
 	Type         types.String `tfsdk:"type"`
+	ID           types.String `tfsdk:"id"`
 	Text         types.String `tfsdk:"text"`
 	ClassName    types.String `tfsdk:"class_name"`
 	BucketName   types.String `tfsdk:"bucket_name"`
@@ -35,6 +36,7 @@ type workerExportModel struct {
 type workerBinding struct {
 	Name         string  `json:"name"`
 	Type         string  `json:"type"`
+	ID           *string `json:"id,omitempty"`
 	Text         *string `json:"text,omitempty"`
 	ClassName    *string `json:"class_name,omitempty"`
 	BucketName   *string `json:"bucket_name,omitempty"`
@@ -103,10 +105,10 @@ func workerConfiguration(ctx context.Context, model workerReleaseModel, manifest
 	seen := map[string]bool{}
 	for _, binding := range bindings {
 		value := workerBinding{
-			Name: binding.Name.ValueString(), Type: binding.Type.ValueString(), Text: binding.Text.ValueStringPointer(),
-			ClassName: binding.ClassName.ValueStringPointer(), BucketName: binding.BucketName.ValueStringPointer(),
-			Jurisdiction: binding.Jurisdiction.ValueStringPointer(), StoreID: binding.StoreID.ValueStringPointer(),
-			SecretName: binding.SecretName.ValueStringPointer(),
+			Name: binding.Name.ValueString(), Type: binding.Type.ValueString(), ID: binding.ID.ValueStringPointer(),
+			Text: binding.Text.ValueStringPointer(), ClassName: binding.ClassName.ValueStringPointer(),
+			BucketName: binding.BucketName.ValueStringPointer(), Jurisdiction: binding.Jurisdiction.ValueStringPointer(),
+			StoreID: binding.StoreID.ValueStringPointer(), SecretName: binding.SecretName.ValueStringPointer(),
 		}
 		if value.Name == "" || seen[value.Name] {
 			return config, errors.New("Worker bindings must have distinct nonempty names.")
@@ -167,18 +169,20 @@ func validateWorkerBinding(binding workerBinding) error {
 	valid := false
 	switch binding.Type {
 	case "assets":
-		valid = binding.Text == nil && binding.ClassName == nil && binding.BucketName == nil && binding.Jurisdiction == nil && binding.StoreID == nil && binding.SecretName == nil
+		valid = binding.ID == nil && binding.Text == nil && binding.ClassName == nil && binding.BucketName == nil && binding.Jurisdiction == nil && binding.StoreID == nil && binding.SecretName == nil
 	case "plain_text":
-		valid = binding.Text != nil && binding.ClassName == nil && binding.BucketName == nil && binding.Jurisdiction == nil && binding.StoreID == nil && binding.SecretName == nil
+		valid = binding.Text != nil && binding.ID == nil && binding.ClassName == nil && binding.BucketName == nil && binding.Jurisdiction == nil && binding.StoreID == nil && binding.SecretName == nil
 	case "durable_object_namespace":
-		valid = binding.ClassName != nil && *binding.ClassName != "" && binding.Text == nil && binding.BucketName == nil && binding.Jurisdiction == nil && binding.StoreID == nil && binding.SecretName == nil
+		valid = binding.ClassName != nil && *binding.ClassName != "" && binding.ID == nil && binding.Text == nil && binding.BucketName == nil && binding.Jurisdiction == nil && binding.StoreID == nil && binding.SecretName == nil
 	case "r2_bucket":
-		valid = binding.BucketName != nil && *binding.BucketName != "" && binding.Text == nil && binding.ClassName == nil && binding.StoreID == nil && binding.SecretName == nil
+		valid = binding.BucketName != nil && *binding.BucketName != "" && binding.ID == nil && binding.Text == nil && binding.ClassName == nil && binding.StoreID == nil && binding.SecretName == nil
 	case "secrets_store_secret":
-		valid = binding.StoreID != nil && *binding.StoreID != "" && binding.SecretName != nil && *binding.SecretName != "" && binding.Text == nil && binding.ClassName == nil && binding.BucketName == nil && binding.Jurisdiction == nil
+		valid = binding.StoreID != nil && *binding.StoreID != "" && binding.SecretName != nil && *binding.SecretName != "" && binding.ID == nil && binding.Text == nil && binding.ClassName == nil && binding.BucketName == nil && binding.Jurisdiction == nil
+	case "hyperdrive":
+		valid = binding.ID != nil && *binding.ID != "" && binding.Text == nil && binding.ClassName == nil && binding.BucketName == nil && binding.Jurisdiction == nil && binding.StoreID == nil && binding.SecretName == nil
 	}
 	if !valid {
-		return errors.New("Use plain_text, durable_object_namespace, r2_bucket, or secrets_store_secret bindings with only their corresponding fields. Credential values and secret_text bindings are not accepted.")
+		return errors.New("Use plain_text, durable_object_namespace, r2_bucket, secrets_store_secret, or hyperdrive bindings with only their corresponding fields. Credential values and secret_text bindings are not accepted.")
 	}
 	return nil
 }
@@ -229,7 +233,7 @@ func workerDigest(content []byte) string {
 
 func workerBindingObjectType() types.ObjectType {
 	attributes := map[string]attr.Type{}
-	for _, name := range []string{"name", "type", "text", "class_name", "bucket_name", "jurisdiction", "store_id", "secret_name"} {
+	for _, name := range []string{"name", "type", "id", "text", "class_name", "bucket_name", "jurisdiction", "store_id", "secret_name"} {
 		attributes[name] = types.StringType
 	}
 	return types.ObjectType{AttrTypes: attributes}
@@ -271,8 +275,8 @@ func (model *workerReleaseModel) readWorkerVersion(ctx context.Context, version 
 			text = types.StringPointerValue(binding.Text)
 		}
 		value := workerBindingModel{
-			Name: types.StringValue(binding.Name), Type: types.StringValue(binding.Type), Text: text,
-			ClassName: types.StringPointerValue(binding.ClassName), BucketName: types.StringPointerValue(binding.BucketName),
+			Name: types.StringValue(binding.Name), Type: types.StringValue(binding.Type), ID: types.StringPointerValue(binding.ID),
+			Text: text, ClassName: types.StringPointerValue(binding.ClassName), BucketName: types.StringPointerValue(binding.BucketName),
 			Jurisdiction: types.StringPointerValue(binding.Jurisdiction), StoreID: types.StringPointerValue(binding.StoreID),
 			SecretName: types.StringPointerValue(binding.SecretName),
 		}

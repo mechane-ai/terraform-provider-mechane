@@ -153,9 +153,9 @@ func (r *workerReleaseResource) findWorkerRelease(ctx context.Context, model wor
 			if summary.Annotations["workers/message"] != message {
 				continue
 			}
-			version, err := r.getWorkerVersion(ctx, model, summary.ID)
+			version, err := r.waitForUploadedWorkerVersion(ctx, model, summary.ID)
 			if err != nil {
-				return workerVersion{}, false, errors.New(describeCloudflareError(err))
+				return workerVersion{}, false, err
 			}
 			actual, err := version.configuration()
 			if err != nil {
@@ -429,9 +429,9 @@ func (r *workerReleaseResource) applyRelease(ctx context.Context, plan workerRel
 	if err != nil {
 		return plan, err
 	}
-	version, err = r.getWorkerVersion(ctx, plan, version.ID)
+	version, err = r.waitForUploadedWorkerVersion(ctx, plan, version.ID)
 	if err != nil {
-		return plan, errors.New(describeCloudflareError(err))
+		return plan, err
 	}
 	if err = plan.readWorkerNamespaces(ctx, version, true); err != nil {
 		return plan, err
